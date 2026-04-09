@@ -1,0 +1,26 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large local datasets and derived outputs
+atspm-*_filtered.csv
+MAPPINGS_DET_INFO_OCT_2022.csv
+derived/
+
+# External repos cloned locally for development
+atspm/
+atspm-report/
+
+# Frontend build artifacts
+dashboard-app/node_modules/
+dashboard-app/dist/
+dashboard-app/.vite/
+dashboard-app/*.tsbuildinfo
+
+# Local sqlite / parquet / cache artifacts
+*.sqlite
+*.sqlite3
+*.parquet
