@@ -130,11 +130,27 @@ type DashboardResponse = {
 };
 
 type HistoricalHour = {
+  runDate: string;
   hour: number;
   label: string;
   status: string;
   sourceRows: number;
   message: string;
+  aogPct: number;
+  avgWait: number;
+  splitFailures: number;
+  maxOuts: number;
+  gapOuts: number;
+  forceOffs: number;
+};
+
+type HistoricalDay = {
+  runDate: string;
+  label: string;
+  sourceRows: number;
+  okHours: number;
+  emptyHours: number;
+  failedHours: number;
   aogPct: number;
   avgWait: number;
   splitFailures: number;
@@ -156,6 +172,7 @@ type HistoricalRunResponse = {
   filteredRows?: number;
   detectorConfigRows?: number;
   createdAt?: string;
+  days: HistoricalDay[];
   summary?: {
     okHours: number;
     emptyHours: number;
@@ -317,8 +334,19 @@ function HistoricalRunView({
   loading: boolean;
   error: string | null;
 }) {
+  const days = historical?.days ?? [];
   const hours = historical?.hours ?? [];
-  const maxRows = Math.max(1, ...hours.map((hour) => hour.sourceRows));
+  const maxDayRows = Math.max(1, ...days.map((day) => day.sourceRows));
+  const maxHeat = Math.max(1, ...hours.map((hour) => hour.avgWait));
+  const hourLabels = Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, "0")}:00`);
+  const hourlyByDay = new Map(
+    days.map((day) => [
+      day.runDate,
+      hourLabels.map((label, index) => hours.find((hour) => hour.runDate === day.runDate && hour.hour === index) ?? null)
+    ])
+  );
+  const bestAogDay = days.reduce((best, current) => (current.aogPct > best.aogPct ? current : best), days[0] ?? null);
+  const worstWaitDay = days.reduce((worst, current) => (current.avgWait > worst.avgWait ? current : worst), days[0] ?? null);
 
   return (
     <main className="workspace historical-workspace">
@@ -349,22 +377,28 @@ function HistoricalRunView({
                 <strong>{historical.signalId}</strong>
               </article>
               <article className="history-stat">
-                <span>Date</span>
-                <strong>{historical.runDate}</strong>
+                <span>Coverage</span>
+                <strong>{days.length} days</strong>
               </article>
               <article className="history-stat">
-                <span>Filtered rows</span>
+                <span>Total rows</span>
                 <strong>{historical.filteredRows?.toLocaleString()}</strong>
               </article>
               <article className="history-stat">
                 <span>Successful hours</span>
-                <strong>{historical.summary?.okHours ?? 0}/24</strong>
+                <strong>{historical.summary?.okHours ?? 0}/{hours.length || 0}</strong>
               </article>
             </div>
 
             <div className="history-paths">
               <p>
-                <strong>Filtered CSV:</strong> {historical.filteredCsvPath}
+                <strong>Best AOG day:</strong> {bestAogDay ? `${bestAogDay.runDate} (${bestAogDay.aogPct.toFixed(1)}%)` : "No data"}
+              </p>
+              <p>
+                <strong>Worst wait day:</strong> {worstWaitDay ? `${worstWaitDay.runDate} (${worstWaitDay.avgWait.toFixed(1)} s)` : "No data"}
+              </p>
+              <p>
+                <strong>Derived day folder:</strong> {historical.filteredCsvPath}
               </p>
               <p>
                 <strong>SQLite DB:</strong> {historical.dbPath}
@@ -380,38 +414,40 @@ function HistoricalRunView({
             <article className="panel">
               <div className="section-header compact">
                 <div>
-                  <p className="section-kicker">Hourly slices</p>
-                  <h2>Event rows by hour</h2>
+                  <p className="section-kicker">Daily delay</p>
+                  <h2>Average wait by day</h2>
                 </div>
               </div>
               <div className="chart-wrap">
                 <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={hours}>
+                  <BarChart data={days}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#d9ddd5" />
                     <XAxis dataKey="label" stroke="#4c5a57" />
                     <YAxis stroke="#4c5a57" />
                     <Tooltip />
-                    <Bar dataKey="sourceRows" name="Event rows" fill="#68a77e" radius={[6, 6, 0, 0]} />
+                    <Bar dataKey="avgWait" name="Avg Wait (s)" fill="#c98358" radius={[6, 6, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
               {insightBlock(
                 "What this shows",
-                "The filtered signal-day CSV broken into one file per hour.",
-                `${historical.summary?.totalSourceRows.toLocaleString()} source rows were stored across the 24 derived hourly files.`
+                "Average phase wait for signal 1470, summarized one day at a time.",
+                worstWaitDay
+                  ? `${worstWaitDay.runDate} has the highest daily wait at ${worstWaitDay.avgWait.toFixed(1)} seconds.`
+                  : "No daily wait data is available."
               )}
             </article>
 
             <article className="panel">
               <div className="section-header compact">
                 <div>
-                  <p className="section-kicker">ATSPM outputs</p>
-                  <h2>Hourly result snapshot</h2>
+                  <p className="section-kicker">Progression</p>
+                  <h2>AOG and split failures by day</h2>
                 </div>
               </div>
               <div className="chart-wrap">
                 <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={hours}>
+                  <LineChart data={days}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#d9ddd5" />
                     <XAxis dataKey="label" stroke="#4c5a57" />
                     <YAxis yAxisId="left" stroke="#4c5a57" />
@@ -419,14 +455,86 @@ function HistoricalRunView({
                     <Tooltip />
                     <Legend />
                     <Line yAxisId="left" type="monotone" dataKey="aogPct" name="AOG %" stroke="#4f8864" strokeWidth={3} />
-                    <Line yAxisId="right" type="monotone" dataKey="avgWait" name="Avg Wait (s)" stroke="#c98358" strokeWidth={2.6} />
+                    <Line yAxisId="right" type="monotone" dataKey="splitFailures" name="Split Failures" stroke="#ae633d" strokeWidth={2.6} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
               {insightBlock(
                 "What this shows",
-                "A quick read of the per-hour ATSPM results stored in SQLite.",
-                "This view is intentionally a raw validation view so we can confirm Shawn's library ran hour-by-hour before polishing the analytics."
+                "Daily arrivals on green compared against daily split failures.",
+                bestAogDay
+                  ? `${bestAogDay.runDate} has the strongest daily AOG at ${bestAogDay.aogPct.toFixed(1)}%.`
+                  : "No daily progression data is available."
+              )}
+            </article>
+          </section>
+
+          <section className="analysis-grid">
+            <article className="panel">
+              <div className="section-header compact">
+                <div>
+                  <p className="section-kicker">Terminations</p>
+                  <h2>Daily phase endings</h2>
+                </div>
+              </div>
+              <div className="chart-wrap">
+                <ResponsiveContainer width="100%" height={300}>
+                  <BarChart data={days}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#d9ddd5" />
+                    <XAxis dataKey="label" stroke="#4c5a57" />
+                    <YAxis stroke="#4c5a57" />
+                    <Tooltip />
+                    <Legend />
+                    <Bar dataKey="maxOuts" name="Max-Outs" fill="#7b3032" radius={[6, 6, 0, 0]} />
+                    <Bar dataKey="gapOuts" name="Gap-Outs" fill="#68a77e" radius={[6, 6, 0, 0]} />
+                    <Bar dataKey="forceOffs" name="Force-Offs" fill="#3f654c" radius={[6, 6, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              {insightBlock(
+                "What this shows",
+                "Daily termination totals showing whether phases ended by max-out, gap-out, or force-off.",
+                "This shows whether the controller behavior was more demand-driven or coordination-driven on each day."
+              )}
+            </article>
+
+            <article className="panel heatmap-panel">
+              <div className="section-header compact">
+                <div>
+                  <p className="section-kicker">Heatmap</p>
+                  <h2>Wait by day and hour</h2>
+                </div>
+              </div>
+              <div className="history-heatmap">
+                <div className="heatmap-header heatmap-corner">Date</div>
+                {hourLabels.map((label) => (
+                  <div key={`history-header-${label}`} className="heatmap-header">
+                    {label}
+                  </div>
+                ))}
+                {days.map((day) => (
+                  <Fragment key={`history-${day.runDate}`}>
+                    <div className="heatmap-row-label">{day.runDate}</div>
+                    {(hourlyByDay.get(day.runDate) ?? []).map((hour, index) => (
+                      <div
+                        key={`${day.runDate}-${index}`}
+                        className="heatmap-value"
+                        style={{
+                          backgroundColor: `rgba(201, 131, 88, ${
+                            hour ? 0.08 + (hour.avgWait / maxHeat) * 0.72 : 0.04
+                          })`
+                        }}
+                      >
+                        <strong>{hour ? hour.avgWait.toFixed(0) : "-"}</strong>
+                      </div>
+                    ))}
+                  </Fragment>
+                ))}
+              </div>
+              {insightBlock(
+                "What this shows",
+                "Average wait intensity by day and hour for the historical run.",
+                "This shows exactly when the worst pressure appears instead of only averaging the whole day together."
               )}
             </article>
           </section>
@@ -435,17 +543,19 @@ function HistoricalRunView({
             <div className="section-header">
               <div>
                 <p className="section-kicker">SQLite</p>
-                <h2>Hourly run status</h2>
+                <h2>Daily run status</h2>
               </div>
-              <p className="section-copy">Each row represents one hourly CSV slice and whether the ATSPM aggregation completed for that slice.</p>
+              <p className="section-copy">Each row represents one day from the 1470 historical run and how many hourly slices were populated or empty.</p>
             </div>
             <div className="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>Hour</th>
-                    <th>Status</th>
+                    <th>Date</th>
                     <th>Source Rows</th>
+                    <th>Ok Hours</th>
+                    <th>Empty Hours</th>
+                    <th>Failed Hours</th>
                     <th>AOG %</th>
                     <th>Avg Wait (s)</th>
                     <th>Split Failures</th>
@@ -456,9 +566,60 @@ function HistoricalRunView({
                   </tr>
                 </thead>
                 <tbody>
+                  {days.map((day) => (
+                    <tr key={day.runDate}>
+                      <td>{day.runDate}</td>
+                      <td>{day.sourceRows.toLocaleString()}</td>
+                      <td>{day.okHours}</td>
+                      <td>{day.emptyHours}</td>
+                      <td>{day.failedHours}</td>
+                      <td>{day.aogPct.toFixed(1)}</td>
+                      <td>{day.avgWait.toFixed(1)}</td>
+                      <td>{day.splitFailures}</td>
+                      <td>{day.maxOuts}</td>
+                      <td>{day.gapOuts}</td>
+                      <td>{day.forceOffs}</td>
+                      <td>
+                        <span className="volume-bar">
+                          <span style={{ width: `${Math.max(2, (day.sourceRows / maxDayRows) * 100)}%` }} />
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="table-panel">
+            <div className="section-header">
+              <div>
+                <p className="section-kicker">Hourly detail</p>
+                <h2>Per-hour validation rows</h2>
+              </div>
+              <p className="section-copy">This is the raw hour-level validation table behind the day summaries above.</p>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Hour</th>
+                    <th>Status</th>
+                    <th>Source Rows</th>
+                    <th>AOG %</th>
+                    <th>Avg Wait (s)</th>
+                    <th>Split Failures</th>
+                    <th>Max-Outs</th>
+                    <th>Gap-Outs</th>
+                    <th>Force-Offs</th>
+                  </tr>
+                </thead>
+                <tbody>
                   {hours.map((hour) => (
-                    <tr key={hour.hour}>
-                      <td>{hour.label}</td>
+                    <tr key={`${hour.runDate}-${hour.hour}`}>
+                      <td>{hour.runDate}</td>
+                      <td>{String(hour.hour).padStart(2, "0")}:00</td>
                       <td>
                         <span className={`history-status ${hour.status}`}>{hour.status}</span>
                       </td>
@@ -469,11 +630,6 @@ function HistoricalRunView({
                       <td>{hour.maxOuts}</td>
                       <td>{hour.gapOuts}</td>
                       <td>{hour.forceOffs}</td>
-                      <td>
-                        <span className="volume-bar">
-                          <span style={{ width: `${Math.max(2, (hour.sourceRows / maxRows) * 100)}%` }} />
-                        </span>
-                      </td>
                     </tr>
                   ))}
                 </tbody>

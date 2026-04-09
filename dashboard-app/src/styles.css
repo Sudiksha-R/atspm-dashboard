@@ -713,6 +713,17 @@ h2 {
   background: #ffffff;
 }
 
+.history-heatmap {
+  display: grid;
+  grid-template-columns: minmax(118px, 140px) repeat(24, minmax(54px, 1fr));
+  gap: 0;
+  align-items: stretch;
+  border: 2px solid rgba(104, 167, 126, 0.58);
+  border-radius: 16px;
+  overflow: auto;
+  background: #ffffff;
+}
+
 .heatmap-header,
 .heatmap-row-label,
 .heatmap-value {
@@ -724,6 +735,13 @@ h2 {
   align-items: center;
   justify-content: center;
   padding: 10px;
+}
+
+.history-heatmap .heatmap-header,
+.history-heatmap .heatmap-row-label,
+.history-heatmap .heatmap-value {
+  min-height: 52px;
+  min-width: 54px;
 }
 
 .heatmap-header,

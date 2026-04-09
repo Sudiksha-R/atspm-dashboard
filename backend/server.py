@@ -21,9 +21,9 @@ from atspm import SignalDataProcessor  # noqa: E402
 
 RAW_PATTERN = re.compile(r"atspm-(\d{4})-(\d{1,2})-(\d{1,2})_filtered\.csv$")
 MAPPING_PATH = ROOT / "MAPPINGS_DET_INFO_OCT_2022.csv"
-HISTORICAL_OUTPUT_DIR = ROOT / "derived" / "historical_1470_2024-10-03"
+HISTORICAL_OUTPUT_DIR = ROOT / "derived" / "dask_historical_1470_all_days"
 HISTORICAL_DB_PATH = HISTORICAL_OUTPUT_DIR / "atspm_hourly_results.sqlite"
-HISTORICAL_FILTERED_CSV = HISTORICAL_OUTPUT_DIR / "signal_1470_2024-10-03_filtered.csv"
+HISTORICAL_FILTERED_CSV = HISTORICAL_OUTPUT_DIR / "days"
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TIME_OF_DAY_PRESETS = [
     {"id": "am-peak", "label": "Weekday AM Peak", "start": "06:00", "end": "09:00"},
@@ -905,11 +905,15 @@ def _sqlite_table_count(conn: sqlite3.Connection, table_name: str) -> int:
 
 
 def _historical_hour_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    status = pd.read_sql_query("SELECT hour, status, source_rows, message FROM hourly_run_status ORDER BY hour", conn)
+    status = pd.read_sql_query(
+        "SELECT run_date, hour, status, source_rows, message FROM hourly_run_status ORDER BY run_date, hour",
+        conn,
+    )
     rows = [
         {
+            "runDate": str(item.run_date),
             "hour": int(item.hour),
-            "label": f"{int(item.hour):02d}:00",
+            "label": f"{str(item.run_date)[5:]} {int(item.hour):02d}:00",
             "status": str(item.status),
             "sourceRows": int(item.source_rows),
             "message": str(item.message),
@@ -922,50 +926,50 @@ def _historical_hour_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         }
         for item in status.itertuples()
     ]
-    by_hour = {row["hour"]: row for row in rows}
+    by_hour = {(row["runDate"], row["hour"]): row for row in rows}
 
     if _sqlite_table_exists(conn, "arrival_on_green"):
         aog = pd.read_sql_query(
             """
-            SELECT hour, AVG(Percent_AOG) * 100 AS aog_pct
+            SELECT run_date, hour, AVG(Percent_AOG) * 100 AS aog_pct
             FROM arrival_on_green
-            GROUP BY hour
+            GROUP BY run_date, hour
             """,
             conn,
         )
         for item in aog.itertuples():
-            by_hour[int(item.hour)]["aogPct"] = round(float(item.aog_pct or 0), 1)
+            by_hour[(str(item.run_date), int(item.hour))]["aogPct"] = round(float(item.aog_pct or 0), 1)
 
     if _sqlite_table_exists(conn, "phase_wait"):
         waits = pd.read_sql_query(
             """
-            SELECT hour, AVG(AvgPhaseWait) AS avg_wait
+            SELECT run_date, hour, AVG(AvgPhaseWait) AS avg_wait
             FROM phase_wait
-            GROUP BY hour
+            GROUP BY run_date, hour
             """,
             conn,
         )
         for item in waits.itertuples():
-            by_hour[int(item.hour)]["avgWait"] = round(float(item.avg_wait or 0), 1)
+            by_hour[(str(item.run_date), int(item.hour))]["avgWait"] = round(float(item.avg_wait or 0), 1)
 
     if _sqlite_table_exists(conn, "split_failures"):
         split = pd.read_sql_query(
             """
-            SELECT hour, SUM(Split_Failure) AS split_failures
+            SELECT run_date, hour, SUM(Split_Failure) AS split_failures
             FROM split_failures
-            GROUP BY hour
+            GROUP BY run_date, hour
             """,
             conn,
         )
         for item in split.itertuples():
-            by_hour[int(item.hour)]["splitFailures"] = int(round(float(item.split_failures or 0)))
+            by_hour[(str(item.run_date), int(item.hour))]["splitFailures"] = int(round(float(item.split_failures or 0)))
 
     if _sqlite_table_exists(conn, "terminations"):
         terms = pd.read_sql_query(
             """
-            SELECT hour, PerformanceMeasure, SUM(Total) AS total
+            SELECT run_date, hour, PerformanceMeasure, SUM(Total) AS total
             FROM terminations
-            GROUP BY hour, PerformanceMeasure
+            GROUP BY run_date, hour, PerformanceMeasure
             """,
             conn,
         )
@@ -973,7 +977,95 @@ def _historical_hour_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         for item in terms.itertuples():
             metric_key = metric_lookup.get(str(item.PerformanceMeasure))
             if metric_key:
-                by_hour[int(item.hour)][metric_key] = int(round(float(item.total or 0)))
+                by_hour[(str(item.run_date), int(item.hour))][metric_key] = int(round(float(item.total or 0)))
+
+    return rows
+
+
+def _historical_day_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    status = pd.read_sql_query(
+        """
+        SELECT
+            run_date,
+            SUM(source_rows) AS source_rows,
+            SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok_hours,
+            SUM(CASE WHEN status = 'empty' THEN 1 ELSE 0 END) AS empty_hours,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_hours
+        FROM hourly_run_status
+        GROUP BY run_date
+        ORDER BY run_date
+        """,
+        conn,
+    )
+    rows = [
+        {
+            "runDate": str(item.run_date),
+            "label": str(item.run_date)[5:],
+            "sourceRows": int(item.source_rows),
+            "okHours": int(item.ok_hours),
+            "emptyHours": int(item.empty_hours),
+            "failedHours": int(item.failed_hours),
+            "aogPct": 0.0,
+            "avgWait": 0.0,
+            "splitFailures": 0,
+            "maxOuts": 0,
+            "gapOuts": 0,
+            "forceOffs": 0,
+        }
+        for item in status.itertuples()
+    ]
+    by_date = {row["runDate"]: row for row in rows}
+
+    if _sqlite_table_exists(conn, "arrival_on_green"):
+        aog = pd.read_sql_query(
+            """
+            SELECT run_date, AVG(Percent_AOG) * 100 AS aog_pct
+            FROM arrival_on_green
+            GROUP BY run_date
+            """,
+            conn,
+        )
+        for item in aog.itertuples():
+            by_date[str(item.run_date)]["aogPct"] = round(float(item.aog_pct or 0), 1)
+
+    if _sqlite_table_exists(conn, "phase_wait"):
+        waits = pd.read_sql_query(
+            """
+            SELECT run_date, AVG(AvgPhaseWait) AS avg_wait
+            FROM phase_wait
+            GROUP BY run_date
+            """,
+            conn,
+        )
+        for item in waits.itertuples():
+            by_date[str(item.run_date)]["avgWait"] = round(float(item.avg_wait or 0), 1)
+
+    if _sqlite_table_exists(conn, "split_failures"):
+        split = pd.read_sql_query(
+            """
+            SELECT run_date, SUM(Split_Failure) AS split_failures
+            FROM split_failures
+            GROUP BY run_date
+            """,
+            conn,
+        )
+        for item in split.itertuples():
+            by_date[str(item.run_date)]["splitFailures"] = int(round(float(item.split_failures or 0)))
+
+    if _sqlite_table_exists(conn, "terminations"):
+        terms = pd.read_sql_query(
+            """
+            SELECT run_date, PerformanceMeasure, SUM(Total) AS total
+            FROM terminations
+            GROUP BY run_date, PerformanceMeasure
+            """,
+            conn,
+        )
+        metric_lookup = {"MaxOut": "maxOuts", "GapOut": "gapOuts", "ForceOff": "forceOffs"}
+        for item in terms.itertuples():
+            metric_key = metric_lookup.get(str(item.PerformanceMeasure))
+            if metric_key:
+                by_date[str(item.run_date)][metric_key] = int(round(float(item.total or 0)))
 
     return rows
 
@@ -982,11 +1074,12 @@ def build_historical_payload() -> dict[str, Any]:
     if not HISTORICAL_DB_PATH.exists():
         return {
             "exists": False,
-            "title": "Signal 1470 hourly ATSPM run",
-            "message": "Run backend/historical_hourly_run.py to generate the derived SQLite database.",
+            "title": "Signal 1470 historical ATSPM run",
+            "message": "Run backend/historical_hourly_run_dask.py to generate the derived SQLite database.",
             "dbPath": str(HISTORICAL_DB_PATH),
             "outputDir": str(HISTORICAL_OUTPUT_DIR),
             "filteredCsvPath": str(HISTORICAL_FILTERED_CSV),
+            "days": [],
             "hours": [],
             "tableCounts": [],
         }
@@ -1011,6 +1104,7 @@ def build_historical_payload() -> dict[str, Any]:
                 "coordination_agg",
             ]
         ]
+        days = _historical_day_rows(conn) if _sqlite_table_exists(conn, "hourly_run_status") else []
         hours = _historical_hour_rows(conn) if _sqlite_table_exists(conn, "hourly_run_status") else []
 
     ok_hours = sum(1 for hour in hours if hour["status"] == "ok")
@@ -1018,16 +1112,17 @@ def build_historical_payload() -> dict[str, Any]:
     failed_hours = sum(1 for hour in hours if hour["status"] == "failed")
     return {
         "exists": True,
-        "title": "Signal 1470 hourly ATSPM run",
+        "title": "Signal 1470 historical ATSPM run",
         "signalId": int(metadata.get("signal_id", 1470)),
-        "runDate": str(metadata.get("run_date", "2024-10-03")),
-        "sourceCsv": str(metadata.get("source_csv", "")),
+        "runDate": "All available October days",
+        "sourceCsv": "Multiple October ATSPM CSV files",
         "dbPath": str(HISTORICAL_DB_PATH),
         "outputDir": str(HISTORICAL_OUTPUT_DIR),
         "filteredCsvPath": str(HISTORICAL_FILTERED_CSV),
-        "filteredRows": int(metadata.get("filtered_rows", 0) or 0),
+        "filteredRows": int(metadata.get("total_source_rows", 0) or 0),
         "detectorConfigRows": int(metadata.get("detector_config_rows", 0) or 0),
         "createdAt": str(metadata.get("created_at", "")),
+        "days": days,
         "summary": {
             "okHours": ok_hours,
             "emptyHours": empty_hours,
