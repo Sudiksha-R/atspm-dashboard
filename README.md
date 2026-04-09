@@ -53,4 +53,4 @@ The backend folder includes scripts for:
 - all-day hourly aggregation for a single signal
 - a Dask-based scalable version for signal-level preprocessing
 
-These scripts write only derived outputs and do not modify the original source datasets.
+
