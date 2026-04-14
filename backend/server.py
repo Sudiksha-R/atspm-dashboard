@@ -9,6 +9,7 @@ from datetime import date, datetime
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -18,12 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "atspm" / "src"))
 
 from atspm import SignalDataProcessor  # noqa: E402
+from historical_hourly_run_dask import _output_paths as historical_output_paths  # noqa: E402
+from historical_hourly_run_dask import run_signal_history  # noqa: E402
 
 RAW_PATTERN = re.compile(r"atspm-(\d{4})-(\d{1,2})-(\d{1,2})_filtered\.csv$")
 MAPPING_PATH = ROOT / "MAPPINGS_DET_INFO_OCT_2022.csv"
-HISTORICAL_OUTPUT_DIR = ROOT / "derived" / "dask_historical_1470_all_days"
-HISTORICAL_DB_PATH = HISTORICAL_OUTPUT_DIR / "atspm_hourly_results.sqlite"
-HISTORICAL_FILTERED_CSV = HISTORICAL_OUTPUT_DIR / "days"
+DEFAULT_HISTORICAL_SIGNAL_ID = "1470"
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TIME_OF_DAY_PRESETS = [
     {"id": "am-peak", "label": "Weekday AM Peak", "start": "06:00", "end": "09:00"},
@@ -174,6 +175,7 @@ def _intersection_inventory() -> list[IntersectionMeta]:
 INTERSECTION_LOOKUP = {meta.id: meta for meta in _intersection_inventory()}
 DEFAULT_SELECTED_IDS = [meta.id for meta in _intersection_inventory()[:3]]
 MISSING_MAPPING_IDS = sorted(set(_available_signal_ids()) - {int(key) for key in INTERSECTION_LOOKUP})
+HISTORICAL_BUILD_LOCK = Lock()
 
 
 def _metric_definitions() -> dict[str, str]:
@@ -1070,21 +1072,61 @@ def _historical_day_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return rows
 
 
-def build_historical_payload() -> dict[str, Any]:
-    if not HISTORICAL_DB_PATH.exists():
+def _historical_signal_id(raw_signal_id: str | None) -> str:
+    if raw_signal_id and raw_signal_id in INTERSECTION_LOOKUP:
+        return raw_signal_id
+    if DEFAULT_HISTORICAL_SIGNAL_ID in INTERSECTION_LOOKUP:
+        return DEFAULT_HISTORICAL_SIGNAL_ID
+    return next(iter(INTERSECTION_LOOKUP.keys()))
+
+
+def _historical_available_signals() -> list[dict[str, str | float]]:
+    return [
+        {
+            "id": meta.id,
+            "name": meta.name,
+            "route": meta.route,
+            "region": meta.region,
+            "lat": meta.lat,
+            "lon": meta.lon,
+        }
+        for meta in _intersection_inventory()
+    ]
+
+
+def _ensure_historical_db(signal_id: str) -> dict[str, Path]:
+    paths = historical_output_paths(int(signal_id))
+    if paths["sqlite_path"].exists():
+        return paths
+    with HISTORICAL_BUILD_LOCK:
+        if paths["sqlite_path"].exists():
+            return paths
+        run_signal_history(int(signal_id))
+    return paths
+
+
+def build_historical_payload(query: dict[str, list[str]]) -> dict[str, Any]:
+    signal_id = _historical_signal_id(query.get("signalId", [None])[0])
+    signal_meta = INTERSECTION_LOOKUP[signal_id]
+    paths = _ensure_historical_db(signal_id)
+
+    if not paths["sqlite_path"].exists():
         return {
             "exists": False,
-            "title": "Signal 1470 historical ATSPM run",
+            "title": f"{signal_meta.name} historical ATSPM run",
             "message": "Run backend/historical_hourly_run_dask.py to generate the derived SQLite database.",
-            "dbPath": str(HISTORICAL_DB_PATH),
-            "outputDir": str(HISTORICAL_OUTPUT_DIR),
-            "filteredCsvPath": str(HISTORICAL_FILTERED_CSV),
+            "signalId": int(signal_id),
+            "selectedSignalId": signal_id,
+            "availableSignals": _historical_available_signals(),
+            "dbPath": str(paths["sqlite_path"]),
+            "outputDir": str(paths["output_dir"]),
+            "filteredCsvPath": str(paths["days_dir"]),
             "days": [],
             "hours": [],
             "tableCounts": [],
         }
 
-    with sqlite3.connect(HISTORICAL_DB_PATH) as conn:
+    with sqlite3.connect(paths["sqlite_path"]) as conn:
         metadata = (
             pd.read_sql_query("SELECT * FROM run_metadata LIMIT 1", conn).iloc[0].to_dict()
             if _sqlite_table_exists(conn, "run_metadata")
@@ -1112,13 +1154,15 @@ def build_historical_payload() -> dict[str, Any]:
     failed_hours = sum(1 for hour in hours if hour["status"] == "failed")
     return {
         "exists": True,
-        "title": "Signal 1470 historical ATSPM run",
-        "signalId": int(metadata.get("signal_id", 1470)),
+        "title": f"{signal_meta.name} historical ATSPM run",
+        "signalId": int(metadata.get("signal_id", int(signal_id))),
+        "selectedSignalId": signal_id,
+        "availableSignals": _historical_available_signals(),
         "runDate": "All available October days",
         "sourceCsv": "Multiple October ATSPM CSV files",
-        "dbPath": str(HISTORICAL_DB_PATH),
-        "outputDir": str(HISTORICAL_OUTPUT_DIR),
-        "filteredCsvPath": str(HISTORICAL_FILTERED_CSV),
+        "dbPath": str(paths["sqlite_path"]),
+        "outputDir": str(paths["output_dir"]),
+        "filteredCsvPath": str(paths["days_dir"]),
         "filteredRows": int(metadata.get("total_source_rows", 0) or 0),
         "detectorConfigRows": int(metadata.get("detector_config_rows", 0) or 0),
         "createdAt": str(metadata.get("created_at", "")),
@@ -1131,6 +1175,392 @@ def build_historical_payload() -> dict[str, Any]:
         },
         "hours": hours,
         "tableCounts": table_counts,
+    }
+
+
+def _sqlite_frame(
+    conn: sqlite3.Connection,
+    table_name: str,
+    select_sql: str,
+    params: tuple[Any, ...],
+) -> pd.DataFrame:
+    if not _sqlite_table_exists(conn, table_name):
+        return pd.DataFrame()
+    return pd.read_sql_query(select_sql, conn, params=params)
+
+
+def _filter_rank_frame(frame: pd.DataFrame, days_of_week: list[str]) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    filtered = frame.copy()
+    filtered["run_date"] = pd.to_datetime(filtered["run_date"], errors="coerce")
+    filtered = filtered.dropna(subset=["run_date"])
+    filtered["day_name"] = filtered["run_date"].dt.day_name()
+    filtered = filtered[filtered["day_name"].isin(days_of_week)].copy()
+    filtered["run_date"] = filtered["run_date"].dt.strftime("%Y-%m-%d")
+    return filtered
+
+
+def build_ranking_payload(query: dict[str, list[str]]) -> dict[str, Any]:
+    available_dates = list(_raw_files().keys())
+    default_date = available_dates[-1]
+
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date)
+    date_to = _safe_date(query.get("dateTo", [None])[0], date_from)
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    days_of_week = _parse_days(query.get("daysOfWeek", [None])[0], date_from, date_to)
+    preset_id, hour_from, hour_to = _parse_hours(
+        query.get("timeOfDayPreset", [None])[0],
+        query.get("hourFrom", [None])[0],
+        query.get("hourTo", [None])[0],
+    )
+    hour_start = int(hour_from.split(":")[0])
+    hour_end = int(hour_to.split(":")[0])
+
+    rows: list[dict[str, Any]] = []
+    sql_params = (date_from.isoformat(), date_to.isoformat(), hour_start, hour_end)
+
+    for meta in _intersection_inventory():
+        sqlite_path = historical_output_paths(int(meta.id))["sqlite_path"]
+        if not sqlite_path.exists():
+            rows.append(
+                {
+                    "id": meta.id,
+                    "name": meta.name,
+                    "route": meta.route,
+                    "region": meta.region,
+                    "hasHistoricalDb": False,
+                    "hasData": False,
+                    "aogPct": None,
+                    "aorPct": None,
+                    "avgWait": None,
+                    "greenOccupancyPct": None,
+                    "redOccupancyPct": None,
+                    "splitFailures": None,
+                    "maxOuts": None,
+                    "forceOffs": None,
+                }
+            )
+            continue
+
+        with sqlite3.connect(sqlite_path) as conn:
+            aog = _sqlite_frame(
+                conn,
+                "arrival_on_green",
+                """
+                SELECT run_date, hour, Percent_AOG
+                FROM arrival_on_green
+                WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+                """,
+                sql_params,
+            )
+            waits = _sqlite_frame(
+                conn,
+                "phase_wait",
+                """
+                SELECT run_date, hour, AvgPhaseWait
+                FROM phase_wait
+                WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+                """,
+                sql_params,
+            )
+            split = _sqlite_frame(
+                conn,
+                "split_failures",
+                """
+                SELECT run_date, hour, Green_Occupancy, Red_Occupancy, Split_Failure
+                FROM split_failures
+                WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+                """,
+                sql_params,
+            )
+            terms = _sqlite_frame(
+                conn,
+                "terminations",
+                """
+                SELECT run_date, hour, PerformanceMeasure, Total
+                FROM terminations
+                WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+                """,
+                sql_params,
+            )
+
+        aog = _filter_rank_frame(aog, days_of_week)
+        waits = _filter_rank_frame(waits, days_of_week)
+        split = _filter_rank_frame(split, days_of_week)
+        terms = _filter_rank_frame(terms, days_of_week)
+
+        has_data = not aog.empty or not waits.empty or not split.empty or not terms.empty
+        max_outs = None
+        force_offs = None
+        if not terms.empty:
+            max_outs = int(round(float(terms.loc[terms["PerformanceMeasure"] == "MaxOut", "Total"].sum())))
+            force_offs = int(round(float(terms.loc[terms["PerformanceMeasure"] == "ForceOff", "Total"].sum())))
+
+        aog_pct = round(float(aog["Percent_AOG"].mean() * 100), 1) if not aog.empty else None
+        rows.append(
+            {
+                "id": meta.id,
+                "name": meta.name,
+                "route": meta.route,
+                "region": meta.region,
+                "hasHistoricalDb": True,
+                "hasData": has_data,
+                "aogPct": aog_pct,
+                "aorPct": round(max(0.0, 100.0 - aog_pct), 1) if aog_pct is not None else None,
+                "avgWait": round(float(waits["AvgPhaseWait"].mean()), 1) if not waits.empty else None,
+                "greenOccupancyPct": round(float(split["Green_Occupancy"].mean() * 100), 1) if not split.empty else None,
+                "redOccupancyPct": round(float(split["Red_Occupancy"].mean() * 100), 1) if not split.empty else None,
+                "splitFailures": int(round(float(split["Split_Failure"].sum()))) if not split.empty else None,
+                "maxOuts": max_outs,
+                "forceOffs": force_offs,
+            }
+        )
+
+    built_count = sum(1 for row in rows if row["hasHistoricalDb"])
+    data_count = sum(1 for row in rows if row["hasData"])
+    return {
+        "meta": {
+            "dataSource": "Historical ATSPM SQLite results",
+            "builtSignals": built_count,
+            "signalsWithData": data_count,
+            "availableSignals": len(rows),
+            "metricDefinitions": {
+                "aogPct": "Arrival on Green percentage from the historical SQLite arrival_on_green table.",
+                "aorPct": "Arrival on Red percentage derived here as 100 minus AOG for the selected filtered window.",
+                "avgWait": "Average phase wait in seconds from the historical SQLite phase_wait table.",
+                "greenOccupancyPct": "Average green occupancy percentage from the historical SQLite split_failures table.",
+                "redOccupancyPct": "Average red occupancy percentage from the historical SQLite split_failures table.",
+                "splitFailures": "Total split failures from the historical SQLite split_failures table.",
+                "maxOuts": "Total Max-Out terminations from the historical SQLite terminations table.",
+                "forceOffs": "Total Force-Off terminations from the historical SQLite terminations table.",
+                "compositeScore": "Composite score built from normalized AOG, AOR, wait, split failures, max-outs, and force-offs for the current filtered window.",
+            },
+        },
+        "filters": {
+            "dateFrom": date_from.isoformat(),
+            "dateTo": date_to.isoformat(),
+            "daysOfWeek": days_of_week,
+            "hourFrom": hour_from,
+            "hourTo": hour_to,
+            "timeOfDayPreset": preset_id,
+        },
+        "rows": rows,
+    }
+
+
+def build_day_hour_payload(query: dict[str, list[str]]) -> dict[str, Any]:
+    available_dates = list(_raw_files().keys())
+    default_date = available_dates[-1]
+
+    signal_id = _historical_signal_id(query.get("signalId", [None])[0])
+    metric = str(query.get("metric", ["avgWait"])[0] or "avgWait")
+    allowed_metrics = {
+        "aogPct",
+        "aorPct",
+        "avgWait",
+        "greenOccupancyPct",
+        "redOccupancyPct",
+        "splitFailures",
+        "maxOuts",
+        "forceOffs",
+    }
+    if metric not in allowed_metrics:
+        metric = "avgWait"
+
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date)
+    date_to = _safe_date(query.get("dateTo", [None])[0], date_from)
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    days_of_week = _parse_days(query.get("daysOfWeek", [None])[0], date_from, date_to)
+    preset_id, hour_from, hour_to = _parse_hours(
+        query.get("timeOfDayPreset", [None])[0],
+        query.get("hourFrom", [None])[0],
+        query.get("hourTo", [None])[0],
+    )
+    hour_start = int(hour_from.split(":")[0])
+    hour_end = int(hour_to.split(":")[0])
+    sql_params = (date_from.isoformat(), date_to.isoformat(), hour_start, hour_end)
+
+    signal_meta = INTERSECTION_LOOKUP[signal_id]
+    sqlite_path = historical_output_paths(int(signal_id))["sqlite_path"]
+    if not sqlite_path.exists():
+        return {
+            "meta": {
+                "dataSource": "Historical ATSPM SQLite results",
+                "metricDefinitions": {},
+                "availableSignals": _historical_available_signals(),
+            },
+            "filters": {
+                "signalId": signal_id,
+                "metric": metric,
+                "dateFrom": date_from.isoformat(),
+                "dateTo": date_to.isoformat(),
+                "daysOfWeek": days_of_week,
+                "hourFrom": hour_from,
+                "hourTo": hour_to,
+                "timeOfDayPreset": preset_id,
+            },
+            "signal": {
+                "id": signal_meta.id,
+                "name": signal_meta.name,
+                "route": signal_meta.route,
+                "region": signal_meta.region,
+                "lat": signal_meta.lat,
+                "lon": signal_meta.lon,
+            },
+            "hours": [f"{hour:02d}:00" for hour in range(hour_start, hour_end + 1)],
+            "days": days_of_week,
+            "cells": [],
+        }
+
+    with sqlite3.connect(sqlite_path) as conn:
+        aog = _sqlite_frame(
+            conn,
+            "arrival_on_green",
+            """
+            SELECT run_date, hour, Percent_AOG
+            FROM arrival_on_green
+            WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+            """,
+            sql_params,
+        )
+        waits = _sqlite_frame(
+            conn,
+            "phase_wait",
+            """
+            SELECT run_date, hour, AvgPhaseWait
+            FROM phase_wait
+            WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+            """,
+            sql_params,
+        )
+        split = _sqlite_frame(
+            conn,
+            "split_failures",
+            """
+            SELECT run_date, hour, Green_Occupancy, Red_Occupancy, Split_Failure
+            FROM split_failures
+            WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+            """,
+            sql_params,
+        )
+        terms = _sqlite_frame(
+            conn,
+            "terminations",
+            """
+            SELECT run_date, hour, PerformanceMeasure, Total
+            FROM terminations
+            WHERE run_date >= ? AND run_date <= ? AND hour >= ? AND hour <= ?
+            """,
+            sql_params,
+        )
+
+    aog = _filter_rank_frame(aog, days_of_week)
+    waits = _filter_rank_frame(waits, days_of_week)
+    split = _filter_rank_frame(split, days_of_week)
+    terms = _filter_rank_frame(terms, days_of_week)
+
+    def _group_metric(frame: pd.DataFrame, value_key: str, transform=None, agg: str = "mean") -> pd.DataFrame:
+        if frame.empty:
+            return pd.DataFrame(columns=["day_name", "hour", "value", "sampleCount"])
+        grouped = frame.copy()
+        grouped["run_date"] = pd.to_datetime(grouped["run_date"], errors="coerce")
+        grouped = grouped.dropna(subset=["run_date"])
+        grouped["day_name"] = grouped["run_date"].dt.day_name()
+        if transform is not None:
+            grouped[value_key] = grouped[value_key].map(transform)
+        if agg == "sum":
+            out = (
+                grouped.groupby(["day_name", "hour"], as_index=False)
+                .agg(value=(value_key, "sum"), sampleCount=(value_key, "size"))
+            )
+        else:
+            out = (
+                grouped.groupby(["day_name", "hour"], as_index=False)
+                .agg(value=(value_key, "mean"), sampleCount=(value_key, "size"))
+            )
+        return out
+
+    metric_frame = pd.DataFrame(columns=["day_name", "hour", "value", "sampleCount"])
+    if metric == "aogPct":
+        metric_frame = _group_metric(aog, "Percent_AOG", lambda value: float(value) * 100, "mean")
+    elif metric == "aorPct":
+        metric_frame = _group_metric(aog, "Percent_AOG", lambda value: 100.0 - float(value) * 100, "mean")
+    elif metric == "avgWait":
+        metric_frame = _group_metric(waits, "AvgPhaseWait", float, "mean")
+    elif metric == "greenOccupancyPct":
+        metric_frame = _group_metric(split, "Green_Occupancy", lambda value: float(value) * 100, "mean")
+    elif metric == "redOccupancyPct":
+        metric_frame = _group_metric(split, "Red_Occupancy", lambda value: float(value) * 100, "mean")
+    elif metric == "splitFailures":
+        metric_frame = _group_metric(split, "Split_Failure", float, "mean")
+    elif metric in {"maxOuts", "forceOffs"} and not terms.empty:
+        measure_name = "MaxOut" if metric == "maxOuts" else "ForceOff"
+        metric_frame = _group_metric(terms.loc[terms["PerformanceMeasure"] == measure_name].copy(), "Total", float, "mean")
+
+    metric_lookup: dict[tuple[str, int], dict[str, Any]] = {}
+    if not metric_frame.empty:
+        for item in metric_frame.itertuples():
+            metric_lookup[(str(item.day_name), int(item.hour))] = {
+                "value": round(float(item.value), 1),
+                "sampleCount": int(item.sampleCount),
+            }
+
+    hours = [f"{hour:02d}:00" for hour in range(hour_start, hour_end + 1)]
+    cells: list[dict[str, Any]] = []
+    for day_name in days_of_week:
+        for hour in range(hour_start, hour_end + 1):
+            point = metric_lookup.get((day_name, hour))
+            cells.append(
+                {
+                    "dayName": day_name,
+                    "hour": hour,
+                    "label": f"{hour:02d}:00",
+                    "value": point["value"] if point else None,
+                    "sampleCount": point["sampleCount"] if point else 0,
+                }
+            )
+
+    return {
+        "meta": {
+            "dataSource": "Historical ATSPM SQLite results",
+            "metricDefinitions": {
+                "aogPct": "Average arrival-on-green percentage for matching day-hour buckets across the selected date window.",
+                "aorPct": "Average arrival-on-red percentage derived as 100 minus arrival-on-green for matching day-hour buckets.",
+                "avgWait": "Average phase wait in seconds for matching day-hour buckets across the selected date window.",
+                "greenOccupancyPct": "Average green occupancy percentage for matching day-hour buckets.",
+                "redOccupancyPct": "Average red occupancy percentage for matching day-hour buckets.",
+                "splitFailures": "Average split-failure count for matching day-hour buckets.",
+                "maxOuts": "Average Max-Out termination count for matching day-hour buckets.",
+                "forceOffs": "Average Force-Off termination count for matching day-hour buckets.",
+            },
+            "availableSignals": _historical_available_signals(),
+        },
+        "filters": {
+            "signalId": signal_id,
+            "metric": metric,
+            "dateFrom": date_from.isoformat(),
+            "dateTo": date_to.isoformat(),
+            "daysOfWeek": days_of_week,
+            "hourFrom": hour_from,
+            "hourTo": hour_to,
+            "timeOfDayPreset": preset_id,
+        },
+        "signal": {
+            "id": signal_meta.id,
+            "name": signal_meta.name,
+            "route": signal_meta.route,
+            "region": signal_meta.region,
+            "lat": signal_meta.lat,
+            "lon": signal_meta.lon,
+        },
+        "hours": hours,
+        "days": days_of_week,
+        "cells": cells,
     }
 
 
@@ -1161,8 +1591,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/dashboard":
             self._send_json(build_dashboard_payload(parse_qs(parsed.query)))
             return
+        if parsed.path == "/api/ranking":
+            self._send_json(build_ranking_payload(parse_qs(parsed.query)))
+            return
+        if parsed.path == "/api/day-hour":
+            self._send_json(build_day_hour_payload(parse_qs(parsed.query)))
+            return
         if parsed.path == "/api/historical-run":
-            self._send_json(build_historical_payload())
+            self._send_json(build_historical_payload(parse_qs(parsed.query)))
             return
         self._send_json({"error": "Not found"}, 404)
 

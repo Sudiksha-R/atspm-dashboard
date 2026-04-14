@@ -264,7 +264,7 @@ h2 {
   display: grid;
   grid-template-columns: auto auto 1fr;
   gap: 12px;
-  align-items: center;
+  align-items: start;
   padding: 12px 14px;
   border-radius: 16px;
   background: #ffffff;
@@ -282,19 +282,80 @@ h2 {
   box-shadow: inset 3px 0 0 var(--sage);
 }
 
+.intersection-row.tone-best {
+  border-color: #7eab8e;
+}
+
+.intersection-row.tone-watch {
+  border-color: #9eb2a9;
+}
+
+.intersection-row.tone-alert {
+  border-color: #d3946b;
+}
+
+.intersection-row.tone-nodata {
+  border-color: #ced8d3;
+}
+
 .row-index {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  min-width: 34px;
+  padding-top: 2px;
 }
 
-.intersection-pin span {
+.intersection-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.intersection-name {
+  font-weight: 700;
+}
+
+.intersection-meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
+.intersection-pin-shell {
+  background: transparent;
+  border: 0;
+}
+
+.map-pin {
   display: block;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
-  background: radial-gradient(circle at 30% 30%, #ffd8b1, #f4a259 48%, #bc4749 100%);
-  border: 2px solid rgba(255, 255, 255, 0.95);
+  border: 2px solid rgba(255, 255, 255, 0.96);
   box-shadow: 0 8px 16px rgba(20, 37, 35, 0.25);
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.map-pin--best {
+  background: radial-gradient(circle at 30% 30%, #d7f0de, #68a77e 48%, #35694a 100%);
+}
+
+.map-pin--watch {
+  background: radial-gradient(circle at 30% 30%, #f4f7f5, #9db6ab 48%, #5f776d 100%);
+}
+
+.map-pin--alert {
+  background: radial-gradient(circle at 30% 30%, #f6d5c4, #d98a5d 48%, #a34d35 100%);
+}
+
+.map-pin--nodata {
+  background: radial-gradient(circle at 30% 30%, #f4f6f5, #c3cfca 48%, #85938d 100%);
+}
+
+.map-pin--active {
+  transform: scale(1.22);
+  border: 2px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 0 0 0 3px rgba(104, 167, 126, 0.24), 0 10px 18px rgba(20, 37, 35, 0.28);
 }
 
 .filters-grid {
@@ -796,6 +857,49 @@ h2 {
   overflow: visible;
 }
 
+.historical-top-frame {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
+  gap: 18px;
+  align-items: start;
+  margin-bottom: 18px;
+}
+
+.historical-map-card {
+  display: grid;
+  gap: 10px;
+}
+
+.historical-map-frame {
+  border-radius: 20px;
+  overflow: hidden;
+  border: 2px solid rgba(104, 167, 126, 0.5);
+  min-height: 260px;
+}
+
+.historical-leaflet-map {
+  height: 260px;
+}
+
+.historical-select-wrap {
+  display: grid;
+  gap: 10px;
+  min-width: 320px;
+}
+
+.historical-select-wrap label {
+  display: grid;
+  gap: 8px;
+}
+
+.historical-select-wrap select {
+  border: 2px solid var(--sage);
+  border-radius: 12px;
+  background: #ffffff;
+  color: var(--ink);
+  padding: 10px 12px;
+}
+
 .historical-summary-grid,
 .table-count-grid {
   display: grid;
@@ -894,6 +998,152 @@ h2 {
   overflow-x: auto;
 }
 
+.ranking-workspace {
+  gap: 20px;
+}
+
+.ranking-summary-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 1.1fr 0.9fr;
+  gap: 18px;
+}
+
+.ranking-mini-list {
+  display: grid;
+  gap: 10px;
+}
+
+.ranking-mini-row {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 2px solid rgba(104, 167, 126, 0.34);
+  background: linear-gradient(90deg, #ffffff 0%, #edf5ef 100%);
+}
+
+.ranking-mini-row strong,
+.ranking-class-card strong {
+  color: var(--ink);
+}
+
+.ranking-mini-row span,
+.ranking-class-card span {
+  display: block;
+  color: var(--muted);
+}
+
+.ranking-mini-rank {
+  display: inline-grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 2px solid rgba(201, 131, 88, 0.72);
+  color: var(--accent-deep);
+  font-weight: 700;
+  background: #ffffff;
+}
+
+.ranking-class-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ranking-class-card {
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 2px solid rgba(201, 131, 88, 0.4);
+  background: linear-gradient(120deg, #ffffff 0%, #f7efe9 100%);
+  display: grid;
+  gap: 6px;
+}
+
+.ranking-table-panel {
+  overflow: visible;
+}
+
+.ranking-table {
+  min-width: 1220px;
+}
+
+.ranking-name-cell {
+  display: grid;
+  gap: 4px;
+}
+
+.ranking-name-cell strong {
+  color: var(--ink);
+}
+
+.ranking-name-cell span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.ranking-moe-cell {
+  border: 2px solid transparent;
+  border-radius: 12px;
+  font-weight: 700;
+  padding: 10px 12px;
+}
+
+.ranking-sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  padding: 0;
+  cursor: pointer;
+}
+
+.ranking-sort-button span {
+  color: var(--accent-deep);
+  font-size: 0.85rem;
+}
+
+.ranking-sort-button.active {
+  color: var(--ink);
+}
+
+.ranking-header-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.day-hour-table {
+  min-width: 920px;
+}
+
+.day-hour-label {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.day-hour-cell {
+  text-align: center;
+  font-weight: 700;
+  border-radius: 12px;
+  border: 2px solid rgba(104, 167, 126, 0.34);
+  padding: 12px 10px;
+  min-width: 74px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -923,7 +1173,12 @@ tbody tr:hover {
 @media (max-width: 1100px) {
   .map-frame,
   .analysis-grid,
-  .filters-grid {
+  .filters-grid,
+  .ranking-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .historical-top-frame {
     grid-template-columns: 1fr;
   }
 
@@ -941,7 +1196,8 @@ tbody tr:hover {
   }
 
   .historical-summary-grid,
-  .table-count-grid {
+  .table-count-grid,
+  .ranking-class-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -999,7 +1255,8 @@ tbody tr:hover {
   }
 
   .historical-summary-grid,
-  .table-count-grid {
+  .table-count-grid,
+  .ranking-class-grid {
     grid-template-columns: 1fr;
   }
 }

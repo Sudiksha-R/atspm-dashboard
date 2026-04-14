@@ -240,11 +240,9 @@ def _write_metadata(
     metadata.to_sql("run_metadata", conn, if_exists="replace", index=False)
 
 
-def main() -> None:
-    args = _parse_args()
-    signal_id = args.signal_id
+def run_signal_history(signal_id: int, pattern: str = "atspm-2024-10-*_filtered.csv") -> dict[str, Path]:
     run_id = f"signal-{signal_id}-october-hourly-dask"
-    files = _raw_files(args.pattern)
+    files = _raw_files(pattern)
     paths = _output_paths(signal_id)
     _prepare_output_dir(paths)
 
@@ -337,6 +335,12 @@ def main() -> None:
         pd.DataFrame(file_rows).to_sql("hour_files", conn, if_exists="replace", index=False)
         pd.DataFrame(status_rows).to_sql("hourly_run_status", conn, if_exists="replace", index=False)
 
+    return paths
+
+
+def main() -> None:
+    args = _parse_args()
+    paths = run_signal_history(args.signal_id, args.pattern)
     print(f"Wrote Dask-derived outputs: {paths['output_dir']}")
     print(f"Wrote SQLite results: {paths['sqlite_path']}")
 
