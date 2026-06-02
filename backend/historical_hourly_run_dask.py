@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
 import sys
@@ -14,8 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "atspm" / "src"))
 
 from atspm import SignalDataProcessor  # noqa: E402
+from mapping_store import load_effective_mapping  # noqa: E402
 
-MAPPING_CSV = ROOT / "MAPPINGS_DET_INFO_OCT_2022.csv"
+DEFAULT_RAW_GLOB = "atspm-*_filtered.csv"
+BEE_RIDGE_DATA_DIR = ROOT / "derived" / "bee_ridge_atspm_v3"
 RAW_COLUMNS = ["signalID", "timeStamp", "eventCode", "eventParam"]
 AGGREGATION_TABLES = [
     "has_data",
@@ -34,15 +37,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--signal-id", type=int, default=1470, help="Signal ID to process.")
     parser.add_argument(
         "--pattern",
-        default="atspm-2024-10-*_filtered.csv",
+        default=DEFAULT_RAW_GLOB,
         help="Glob pattern for the raw daily ATSPM CSV files.",
     )
     return parser.parse_args()
 
 
+def _raw_data_dir() -> Path:
+    if raw_dir := os.environ.get("ATSPM_RAW_DIR"):
+        return Path(raw_dir)
+    if BEE_RIDGE_DATA_DIR.exists() and any(BEE_RIDGE_DATA_DIR.glob(DEFAULT_RAW_GLOB)):
+        return BEE_RIDGE_DATA_DIR
+    return ROOT
+
+
 def _raw_files(pattern: str) -> list[tuple[str, Path]]:
     parsed: list[tuple[str, Path]] = []
-    for path in sorted(ROOT.glob(pattern)):
+    for path in sorted(_raw_data_dir().glob(pattern)):
         stem = path.stem.replace("atspm-", "").replace("_filtered", "")
         year, month, day = stem.split("-")
         parsed.append((f"{year}-{int(month):02d}-{int(day):02d}", path))
@@ -59,7 +70,9 @@ def _source_file_date(path_value: object) -> str:
 
 
 def _output_paths(signal_id: int) -> dict[str, Path]:
-    output_dir = ROOT / "derived" / f"dask_historical_{signal_id}_all_days"
+    suffix = os.environ.get("ATSPM_HISTORICAL_SUFFIX", "").strip()
+    suffix_part = f"_{suffix}" if suffix else ""
+    output_dir = ROOT / "derived" / f"dask_historical_{signal_id}_all_days{suffix_part}"
     return {
         "output_dir": output_dir,
         "days_dir": output_dir / "days",
@@ -75,13 +88,8 @@ def _prepare_output_dir(paths: dict[str, Path]) -> None:
 
 
 def _build_detector_config(signal_id: int) -> pd.DataFrame:
-    mapping = pd.read_csv(MAPPING_CSV)
-    mapping["DeviceId"] = pd.to_numeric(mapping["SIIA_ID"], errors="coerce")
+    mapping = load_effective_mapping()
     mapping = mapping[mapping["DeviceId"] == signal_id].copy()
-    mapping["Phase"] = pd.to_numeric(mapping["phase"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
-    mapping["Parameter"] = pd.to_numeric(mapping["channel"], errors="coerce")
-    mapping["distanceToStopbar"] = pd.to_numeric(mapping["distanceToStopbar"], errors="coerce").fillna(0)
-    mapping["Function"] = mapping["distanceToStopbar"].apply(lambda value: "Advance" if value > 0 else "Presence")
     mapping = mapping.dropna(subset=["DeviceId", "Phase", "Parameter"])
     mapping["DeviceId"] = mapping["DeviceId"].astype(int)
     mapping["Phase"] = mapping["Phase"].astype(int)
@@ -240,7 +248,7 @@ def _write_metadata(
     metadata.to_sql("run_metadata", conn, if_exists="replace", index=False)
 
 
-def run_signal_history(signal_id: int, pattern: str = "atspm-2024-10-*_filtered.csv") -> dict[str, Path]:
+def run_signal_history(signal_id: int, pattern: str = DEFAULT_RAW_GLOB) -> dict[str, Path]:
     run_id = f"signal-{signal_id}-october-hourly-dask"
     files = _raw_files(pattern)
     paths = _output_paths(signal_id)

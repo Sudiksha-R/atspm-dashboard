@@ -11,9 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "atspm" / "src"))
 
 from atspm import SignalDataProcessor  # noqa: E402
+from mapping_store import load_effective_mapping  # noqa: E402
 
 SIGNAL_ID = 1470
-MAPPING_CSV = ROOT / "MAPPINGS_DET_INFO_OCT_2022.csv"
 OUTPUT_DIR = ROOT / "derived" / f"historical_{SIGNAL_ID}_all_days"
 DAYS_DIR = OUTPUT_DIR / "days"
 SQLITE_PATH = OUTPUT_DIR / "atspm_hourly_results_all_days.sqlite"
@@ -48,13 +48,8 @@ def _prepare_output_dir() -> None:
 
 
 def _build_detector_config() -> pd.DataFrame:
-    mapping = pd.read_csv(MAPPING_CSV)
-    mapping["DeviceId"] = pd.to_numeric(mapping["SIIA_ID"], errors="coerce")
+    mapping = load_effective_mapping()
     mapping = mapping[mapping["DeviceId"] == SIGNAL_ID].copy()
-    mapping["Phase"] = pd.to_numeric(mapping["phase"].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
-    mapping["Parameter"] = pd.to_numeric(mapping["channel"], errors="coerce")
-    mapping["distanceToStopbar"] = pd.to_numeric(mapping["distanceToStopbar"], errors="coerce").fillna(0)
-    mapping["Function"] = mapping["distanceToStopbar"].apply(lambda value: "Advance" if value > 0 else "Presence")
     mapping = mapping.dropna(subset=["DeviceId", "Phase", "Parameter"])
     mapping["DeviceId"] = mapping["DeviceId"].astype(int)
     mapping["Phase"] = mapping["Phase"].astype(int)
