@@ -20,6 +20,7 @@ import {
 } from "recharts";
 
 const Plot = createPlotlyComponent(Plotly as never) as ComponentType<Record<string, unknown>>;
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
 
 type MetricCard = {
   id: string;
@@ -3699,7 +3700,7 @@ export function App() {
       const params = buildDashboardParams();
 
       try {
-        const response = await fetch(`http://127.0.0.1:8000/api/dashboard?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/dashboard?${params.toString()}`, {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3751,7 +3752,7 @@ export function App() {
       const params = buildHistoricalDashboardParams();
 
       try {
-        const response = await fetch(`http://127.0.0.1:8000/api/historical-dashboard?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/historical-dashboard?${params.toString()}`, {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3801,7 +3802,7 @@ export function App() {
           hourTo: filters.hourTo,
           timeOfDayPreset: filters.timeOfDayPreset
         });
-        const response = await fetch(`http://127.0.0.1:8000/api/ranking?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/ranking?${params.toString()}`, {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3842,7 +3843,7 @@ export function App() {
       setHistoricalError(null);
       try {
         const params = new URLSearchParams({ signalId: historicalSignalId });
-        const response = await fetch(`http://127.0.0.1:8000/api/historical-run?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/historical-run?${params.toString()}`, {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3886,7 +3887,7 @@ export function App() {
           hourTo: filters.hourTo,
           timeOfDayPreset: filters.timeOfDayPreset
         });
-        const response = await fetch(`http://127.0.0.1:8000/api/day-hour?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/day-hour?${params.toString()}`, {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3934,7 +3935,7 @@ export function App() {
           eps: bottleneckEps,
           minSamples: bottleneckMinSamples,
         });
-        const response = await fetch(`http://127.0.0.1:8000/api/bottleneck-clusters?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/bottleneck-clusters?${params.toString()}`, {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -3977,7 +3978,7 @@ export function App() {
           minSamples: hdbscanMinSamples,
           clusterSelectionEpsilon: hdbscanClusterSelectionEpsilon,
         });
-        const response = await fetch(`http://127.0.0.1:8000/api/hdbscan-clusters?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/hdbscan-clusters?${params.toString()}`, {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -4029,7 +4030,7 @@ export function App() {
           selectedDate: changeDetectionSelectedDate,
           selectedHour: changeDetectionSelectedHour,
         });
-        const response = await fetch(`http://127.0.0.1:8000/api/change-detection?${params.toString()}`, {
+        const response = await fetch(`${API_BASE_URL}/api/change-detection?${params.toString()}`, {
           signal: controller.signal
         });
         if (!response.ok) {
