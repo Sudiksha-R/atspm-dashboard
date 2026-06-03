@@ -28,7 +28,11 @@ from mapping_store import load_effective_mapping  # noqa: E402
 
 RAW_PATTERN = re.compile(r"atspm-(\d{4})-(\d{1,2})-(\d{1,2})_filtered\.csv$")
 DEFAULT_RAW_GLOB = "atspm-*_filtered.csv"
-BEE_RIDGE_DATA_DIR = ROOT / "derived" / "bee_ridge_atspm_v3"
+DEFAULT_BEE_RIDGE_DIR_CANDIDATES = (
+    ROOT / "derived" / "bee_ridge_atspm_feb_to_may",
+    ROOT / "derived" / "bee_ridge_atspm_mar_to_may",
+    ROOT / "derived" / "bee_ridge_atspm_v3",
+)
 DEFAULT_HISTORICAL_SIGNAL_ID = "1240"
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 TIME_OF_DAY_PRESETS = [
@@ -145,8 +149,9 @@ def _parse_file_date(path: Path) -> date | None:
 def _raw_data_dir() -> Path:
     if raw_dir := os.environ.get("ATSPM_RAW_DIR"):
         return Path(raw_dir)
-    if BEE_RIDGE_DATA_DIR.exists() and any(BEE_RIDGE_DATA_DIR.glob(DEFAULT_RAW_GLOB)):
-        return BEE_RIDGE_DATA_DIR
+    for candidate in DEFAULT_BEE_RIDGE_DIR_CANDIDATES:
+        if candidate.exists() and any(candidate.glob(DEFAULT_RAW_GLOB)):
+            return candidate
     return ROOT
 
 

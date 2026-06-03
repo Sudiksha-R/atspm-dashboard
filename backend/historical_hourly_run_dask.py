@@ -18,7 +18,11 @@ from atspm import SignalDataProcessor  # noqa: E402
 from mapping_store import load_effective_mapping  # noqa: E402
 
 DEFAULT_RAW_GLOB = "atspm-*_filtered.csv"
-BEE_RIDGE_DATA_DIR = ROOT / "derived" / "bee_ridge_atspm_v3"
+DEFAULT_BEE_RIDGE_DIR_CANDIDATES = (
+    ROOT / "derived" / "bee_ridge_atspm_feb_to_may",
+    ROOT / "derived" / "bee_ridge_atspm_mar_to_may",
+    ROOT / "derived" / "bee_ridge_atspm_v3",
+)
 RAW_COLUMNS = ["signalID", "timeStamp", "eventCode", "eventParam"]
 AGGREGATION_TABLES = [
     "has_data",
@@ -46,8 +50,9 @@ def _parse_args() -> argparse.Namespace:
 def _raw_data_dir() -> Path:
     if raw_dir := os.environ.get("ATSPM_RAW_DIR"):
         return Path(raw_dir)
-    if BEE_RIDGE_DATA_DIR.exists() and any(BEE_RIDGE_DATA_DIR.glob(DEFAULT_RAW_GLOB)):
-        return BEE_RIDGE_DATA_DIR
+    for candidate in DEFAULT_BEE_RIDGE_DIR_CANDIDATES:
+        if candidate.exists() and any(candidate.glob(DEFAULT_RAW_GLOB)):
+            return candidate
     return ROOT
 
 
@@ -71,6 +76,10 @@ def _source_file_date(path_value: object) -> str:
 
 def _output_paths(signal_id: int) -> dict[str, Path]:
     suffix = os.environ.get("ATSPM_HISTORICAL_SUFFIX", "").strip()
+    if not suffix:
+        raw_dir_name = _raw_data_dir().name
+        if raw_dir_name.startswith("bee_ridge_atspm_"):
+            suffix = raw_dir_name.removeprefix("bee_ridge_atspm_")
     suffix_part = f"_{suffix}" if suffix else ""
     output_dir = ROOT / "derived" / f"dask_historical_{signal_id}_all_days{suffix_part}"
     return {
