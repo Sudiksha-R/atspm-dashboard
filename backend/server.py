@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,11 +21,16 @@ from sklearn.cluster import DBSCAN, HDBSCAN
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "atspm" / "src"))
+sys.path.insert(0, str(ROOT / "Correlation_Feature (1)"))
 
 from atspm import SignalDataProcessor  # noqa: E402
 from historical_hourly_run_dask import _output_paths as historical_output_paths  # noqa: E402
 from historical_hourly_run_dask import run_signal_history  # noqa: E402
 from mapping_store import load_effective_mapping  # noqa: E402
+from synchrony import AnalysisRequest, Direction, RawObservation, run_grouping_analysis  # noqa: E402
+import bottleneck_detection as bd  # noqa: E402
+from bottleneck_detection.schemas import BottleneckRequest, ThresholdSpec  # noqa: E402
+import corridor_correlation_cliques as ccc  # noqa: E402
 
 RAW_PATTERN = re.compile(r"atspm-(\d{4})-(\d{1,2})-(\d{1,2})_filtered\.csv$")
 DEFAULT_RAW_GLOB = "atspm-*_filtered.csv"
@@ -35,6 +41,7 @@ DEFAULT_BEE_RIDGE_DIR_CANDIDATES = (
 )
 DEFAULT_HISTORICAL_SIGNAL_ID = "1240"
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+WEEKDAY_NAMES = DAY_NAMES[:5]
 TIME_OF_DAY_PRESETS = [
     {"id": "am-peak", "label": "Weekday AM Peak", "start": "06:00", "end": "09:00"},
     {"id": "midday", "label": "Midday", "start": "10:00", "end": "14:00"},
@@ -42,6 +49,29 @@ TIME_OF_DAY_PRESETS = [
     {"id": "weekend-daytime", "label": "Weekend Daytime", "start": "09:00", "end": "20:00"},
     {"id": "custom", "label": "Custom Period", "start": "06:00", "end": "18:00"},
 ]
+RESPONSE_CACHE_MAX_ITEMS = 48
+RESPONSE_CACHE: dict[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], dict[str, Any]] = {}
+RESPONSE_CACHE_LOCK = Lock()
+GROUPING_MOE_ALIASES = {
+    "avgWait": "avgWait",
+    "aogPct": "aogPct",
+    "aorPct": "aorPct",
+    "greenOccupancyPct": "greenOccupancyPct",
+    "redOccupancyPct": "redOccupancyPct",
+    "splitFailures": "splitFailures",
+    "maxOuts": "maxOuts",
+    "forceOffs": "forceOffs",
+}
+BOTTLENECK_DETECTION_MOE_CONFIG = {
+    "aogPct": {"label": "AOG %", "unit": "%", "badDirection": "below", "defaultThreshold": 40.0, "worstRef": 0.0},
+    "aorPct": {"label": "AOR %", "unit": "%", "badDirection": "above", "defaultThreshold": 60.0, "worstRef": 100.0},
+    "avgWait": {"label": "Avg Wait", "unit": "sec", "badDirection": "above", "defaultThreshold": 55.0, "worstRef": 180.0},
+    "greenOccupancyPct": {"label": "Green Occ %", "unit": "%", "badDirection": "below", "defaultThreshold": 40.0, "worstRef": 0.0},
+    "redOccupancyPct": {"label": "Red Occ %", "unit": "%", "badDirection": "above", "defaultThreshold": 60.0, "worstRef": 100.0},
+    "splitFailures": {"label": "Split Failures", "unit": "per hr", "badDirection": "above", "defaultThreshold": 3.0, "worstRef": 20.0},
+    "maxOuts": {"label": "Max-Outs", "unit": "per hr", "badDirection": "above", "defaultThreshold": 5.0, "worstRef": 30.0},
+    "forceOffs": {"label": "Force-Offs", "unit": "per hr", "badDirection": "above", "defaultThreshold": 5.0, "worstRef": 30.0},
+}
 
 PHASE_TABLE_COLUMNS = [
     "DeviceId",
@@ -246,9 +276,13 @@ def _intersection_inventory() -> list[IntersectionMeta]:
     ]
 
 
+def _corridor_intersection_inventory() -> list[IntersectionMeta]:
+    return sorted(_intersection_inventory(), key=lambda meta: meta.lon)
+
+
 INTERSECTION_LOOKUP = {meta.id: meta for meta in _intersection_inventory()}
 ORDERED_SIGNAL_IDS = [meta.id for meta in sorted(_intersection_inventory(), key=lambda meta: int(meta.id))]
-DEFAULT_SELECTED_IDS = ORDERED_SIGNAL_IDS[:3]
+DEFAULT_SELECTED_IDS = [meta.id for meta in _corridor_intersection_inventory()]
 LAST_THREE_IDS = ORDERED_SIGNAL_IDS[-3:]
 MISSING_MAPPING_IDS = sorted(set(_available_signal_ids()) - {int(key) for key in INTERSECTION_LOOKUP})
 HISTORICAL_BUILD_LOCK = Lock()
@@ -284,9 +318,17 @@ def _parse_days(raw_days: str | None, fallback_date_from: date, fallback_date_to
         selected = [part.strip() for part in raw_days.split(",") if part.strip() in DAY_NAMES]
         if selected:
             return selected
-    if fallback_date_from == fallback_date_to:
-        return [fallback_date_from.strftime("%A")]
-    return DAY_NAMES
+    return WEEKDAY_NAMES
+
+
+def _default_date_window(available_dates: list[date]) -> tuple[date, date]:
+    if not available_dates:
+        default_date = _default_analysis_date()
+        return default_date, default_date
+    date_to = max(available_dates)
+    earliest = min(available_dates)
+    date_from = max(earliest, date_to - timedelta(days=30))
+    return date_from, date_to
 
 
 def _parse_preset(preset_id: str | None) -> dict[str, str]:
@@ -536,7 +578,11 @@ def _phase_table(tables: dict[str, pd.DataFrame], selected_phase: str) -> pd.Dat
         if column not in phase_table.columns:
             phase_table[column] = 0
 
-    if selected_phase != "all":
+    if selected_phase == "all_except_2_6":
+        phase_table = phase_table[~phase_table["Phase"].isin([2, 6])]
+        if phase_table.empty:
+            return _empty_phase_table()
+    elif selected_phase != "all":
         phase_table = phase_table[phase_table["Phase"] == int(selected_phase)]
         if phase_table.empty:
             return _empty_phase_table()
@@ -571,7 +617,16 @@ def _trend_table(
     terminations = with_bucket(tables["terminations"])
     coordination = with_bucket(tables["coordination_agg"])
 
-    if selected_phase != "all":
+    if selected_phase == "all_except_2_6":
+        if not aog.empty and "Phase" in aog.columns:
+            aog = aog[~aog["Phase"].isin([2, 6])]
+        if not split_failures.empty and "Phase" in split_failures.columns:
+            split_failures = split_failures[~split_failures["Phase"].isin([2, 6])]
+        if not phase_wait.empty and "Phase" in phase_wait.columns:
+            phase_wait = phase_wait[~phase_wait["Phase"].isin([2, 6])]
+        if not terminations.empty and "Phase" in terminations.columns:
+            terminations = terminations[~terminations["Phase"].isin([2, 6])]
+    elif selected_phase != "all":
         phase_value = int(selected_phase)
         if not aog.empty and "Phase" in aog.columns:
             aog = aog[aog["Phase"] == phase_value]
@@ -932,7 +987,16 @@ def _historical_dashboard_tables(
         terms = _filter_rank_frame(terms, days_of_week)
         coordination = _filter_rank_frame(coordination, days_of_week)
 
-        if selected_phase != "all":
+        if selected_phase == "all_except_2_6":
+            if not aog.empty:
+                aog = aog[~aog["Phase"].isin([2, 6])]
+            if not waits.empty:
+                waits = waits[~waits["Phase"].isin([2, 6])]
+            if not split.empty:
+                split = split[~split["Phase"].isin([2, 6])]
+            if not terms.empty:
+                terms = terms[~terms["Phase"].isin([2, 6])]
+        elif selected_phase != "all":
             try:
                 phase_value = int(selected_phase)
             except ValueError:
@@ -1082,10 +1146,10 @@ def _historical_dashboard_tables(
 
 def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     available_dates = list(_raw_files().keys())
-    default_date = _default_analysis_date()
+    default_date_from, default_date_to = _default_date_window(available_dates)
 
-    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date)
-    date_to = _safe_date(query.get("dateTo", [None])[0], date_from)
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    date_to = _safe_date(query.get("dateTo", [None])[0], default_date_to)
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
@@ -1174,8 +1238,8 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
                 else ""
             ),
             "availableDates": [item.isoformat() for item in available_dates],
-            "defaultDateFrom": default_date.isoformat(),
-            "defaultDateTo": default_date.isoformat(),
+            "defaultDateFrom": default_date_from.isoformat(),
+            "defaultDateTo": default_date_to.isoformat(),
             "availableDays": DAY_NAMES,
             "timeOfDayPresets": TIME_OF_DAY_PRESETS,
             "selectionPresets": [
@@ -1221,16 +1285,38 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
             "trend": combined_trend,
             "intersections": selected_intersections,
             "allIntersections": all_intersections,
-        },
-    }
+    },
+}
+
+
+def _api_cache_key(path: str, query: dict[str, list[str]]) -> tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]:
+    return (path, tuple(sorted((key, tuple(values)) for key, values in query.items())))
+
+
+def _cached_api_payload(
+    path: str,
+    query: dict[str, list[str]],
+    builder,
+) -> dict[str, Any]:
+    key = _api_cache_key(path, query)
+    with RESPONSE_CACHE_LOCK:
+        cached = RESPONSE_CACHE.get(key)
+        if cached is not None:
+            return cached
+    payload = builder(query)
+    with RESPONSE_CACHE_LOCK:
+        if len(RESPONSE_CACHE) >= RESPONSE_CACHE_MAX_ITEMS:
+            RESPONSE_CACHE.pop(next(iter(RESPONSE_CACHE)))
+        RESPONSE_CACHE[key] = payload
+    return payload
 
 
 def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     available_dates = list(_raw_files().keys())
-    default_date = _default_analysis_date()
+    default_date_from, default_date_to = _default_date_window(available_dates)
 
-    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date)
-    date_to = _safe_date(query.get("dateTo", [None])[0], date_from)
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    date_to = _safe_date(query.get("dateTo", [None])[0], default_date_to)
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
@@ -1309,8 +1395,8 @@ def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str,
             "dataSource": "Historical dashboard built from precomputed ATSPM MOE outputs",
             "note": "",
             "availableDates": [item.isoformat() for item in available_dates],
-            "defaultDateFrom": default_date.isoformat(),
-            "defaultDateTo": default_date.isoformat(),
+            "defaultDateFrom": default_date_from.isoformat(),
+            "defaultDateTo": default_date_to.isoformat(),
             "availableDays": DAY_NAMES,
             "timeOfDayPresets": TIME_OF_DAY_PRESETS,
             "selectionPresets": [
@@ -1638,6 +1724,796 @@ def build_historical_payload(query: dict[str, list[str]]) -> dict[str, Any]:
         },
         "hours": hours,
         "tableCounts": table_counts,
+    }
+
+
+def _grouping_sqlite_path(signal_id: str) -> Path:
+    return historical_output_paths(int(signal_id))["sqlite_path"]
+
+
+def _hour_label_to_int(value: str) -> int:
+    return int(value.split(":", 1)[0])
+
+
+def _grouping_metric_source(moe: str) -> tuple[str, str, str]:
+    if moe == "avgWait":
+        return ("phase_wait", "AvgPhaseWait", "")
+    if moe == "aogPct":
+        return ("arrival_on_green", "Percent_AOG", "")
+    if moe == "aorPct":
+        return ("arrival_on_green", "Percent_AOG", "")
+    if moe == "volume":
+        return ("arrival_on_green", "Total_Actuations", "")
+    if moe == "greenOccupancyPct":
+        return ("split_failures", "Green_Occupancy", "")
+    if moe == "redOccupancyPct":
+        return ("split_failures", "Red_Occupancy", "")
+    if moe == "splitFailures":
+        return ("split_failures", "Split_Failure", "")
+    if moe == "maxOuts":
+        return ("terminations", "Total", "MaxOut")
+    if moe == "forceOffs":
+        return ("terminations", "Total", "ForceOff")
+    raise ValueError(f"Unsupported grouping MOE {moe!r}")
+
+
+def _grouping_phase_for_direction(direction: Direction) -> int:
+    return 2 if direction == Direction.LR else 6
+
+
+def _load_grouping_observations(
+    signal_id: str,
+    *,
+    corridor_order: int,
+    direction: Direction,
+    moe: str,
+    start_date: date,
+    end_date: date,
+    weekdays: set[str],
+    hour_from: int,
+    hour_to: int,
+    phase: int,
+) -> list[RawObservation]:
+    sqlite_path = _grouping_sqlite_path(signal_id)
+    if not sqlite_path.exists():
+        return []
+
+    table, value_column, performance_measure = _grouping_metric_source(moe)
+    with sqlite3.connect(sqlite_path) as conn:
+        if not _sqlite_table_exists(conn, table):
+            return []
+
+    selected_columns = f"run_date, hour, DeviceId, Phase, {value_column} AS moe_value"
+    if table == "terminations":
+        selected_columns += ", PerformanceMeasure"
+    query = f"""
+        SELECT {selected_columns}
+        FROM {table}
+        WHERE DeviceId = ?
+          AND run_date BETWEEN ? AND ?
+          AND hour BETWEEN ? AND ?
+          AND Phase = ?
+    """
+    params: list[Any] = [int(signal_id), start_date.isoformat(), end_date.isoformat(), hour_from, hour_to, phase]
+    if table == "terminations":
+        query += " AND PerformanceMeasure = ?"
+        params.append(performance_measure)
+
+    with sqlite3.connect(sqlite_path) as conn:
+        frame = pd.read_sql_query(query, conn, params=params)
+
+    if frame.empty:
+        return []
+
+    frame["run_date"] = pd.to_datetime(frame["run_date"], errors="coerce")
+    frame = frame.dropna(subset=["run_date"])
+    frame["weekday"] = frame["run_date"].dt.day_name()
+    frame = frame[frame["weekday"].isin(weekdays)].copy()
+    if frame.empty:
+        return []
+
+    frame["week_id"] = frame["run_date"].dt.isocalendar().week.astype(int)
+    frame["hour_slot"] = frame["hour"].map(lambda hour: f"{int(hour):02d}:00")
+    frame = frame.dropna(subset=["moe_value"])
+    if moe == "aorPct":
+        frame["moe_value"] = frame["moe_value"].map(lambda value: 100.0 - float(value) * 100.0)
+    elif moe == "aogPct":
+        frame["moe_value"] = frame["moe_value"].map(lambda value: float(value) * 100.0)
+    else:
+        frame["moe_value"] = frame["moe_value"].map(float)
+
+    observations: list[RawObservation] = []
+    for _, row in frame.iterrows():
+        observations.append(
+            RawObservation(
+                intersection_id=str(signal_id),
+                corridor_order=corridor_order,
+                direction=direction,
+                week_id=int(row["week_id"]),
+                date=row["run_date"].date(),
+                weekday=row["weekday"][:3],
+                hour_slot=str(row["hour_slot"]),
+                moe_name=moe,
+                raw_value=float(row["moe_value"]),
+            )
+        )
+    return observations
+
+
+def build_grouping_preview_payload(query: dict[str, list[str]]) -> dict[str, Any]:
+    selected_ids = [value for value in (query.get("intersectionIds", [None])[0] or "").split(",") if value]
+    corridor_inventory = _corridor_intersection_inventory()
+    if not selected_ids:
+        selected_ids = [meta.id for meta in corridor_inventory]
+    selected_ids = [iid for iid in selected_ids if iid in INTERSECTION_LOOKUP]
+
+    moe = query.get("moe", ["avgWait"])[0]
+    if moe not in GROUPING_MOE_ALIASES:
+        moe = "avgWait"
+
+    default_date_from, default_date_to = _default_date_window(list(_raw_files().keys()))
+    date_from_raw = query.get("dateFrom", [None])[0] or query.get("selectedDate", [None])[0]
+    date_to_raw = query.get("dateTo", [None])[0]
+
+    start_date = _safe_date(date_from_raw, default_date_from)
+    end_date = _safe_date(date_to_raw, default_date_to)
+
+    days_raw = query.get("daysOfWeek", [""])[0]
+    weekdays = {day for day in days_raw.split(",") if day} if days_raw else set(WEEKDAY_NAMES)
+    if not weekdays:
+        weekdays = set(WEEKDAY_NAMES)
+
+    hour_from = _hour_label_to_int(query.get("hourFrom", ["06:00"])[0])
+    hour_to = _hour_label_to_int(query.get("hourTo", ["18:00"])[0])
+    if hour_to < hour_from:
+        hour_to = hour_from
+    threshold = _parse_float_range(query.get("threshold", [None])[0], 0.25, 0.05, 0.99)
+
+    ordered = [meta.id for meta in corridor_inventory if meta.id in selected_ids]
+    if not ordered:
+        return {"ok": False, "message": "No intersections matched the current selection."}
+
+    labels_by_id = {meta.id: meta.name for meta in corridor_inventory if meta.id in ordered}
+    ordered_index = {intersection_id: index + 1 for index, intersection_id in enumerate(ordered)}
+    direction_results: dict[str, Any] = {}
+    for direction, phase_group in ((Direction.LR, "phase2"), (Direction.RL, "phase6")):
+        observations: list[RawObservation] = []
+        phase = _grouping_phase_for_direction(direction)
+        for meta in corridor_inventory:
+            if meta.id not in ordered_index:
+                continue
+            observations.extend(
+                _load_grouping_observations(
+                    meta.id,
+                    corridor_order=ordered_index[meta.id],
+                    direction=direction,
+                    moe=moe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    weekdays=weekdays,
+                    hour_from=hour_from,
+                    hour_to=hour_to,
+                    phase=phase,
+                )
+            )
+
+        avg_moe_by_intersection: dict[str, float] = {}
+        values_by_intersection: dict[str, list[float]] = {}
+        for observation in observations:
+            values_by_intersection.setdefault(observation.intersection_id, []).append(observation.raw_value)
+        for intersection_id, values in values_by_intersection.items():
+            if values:
+                avg_moe_by_intersection[intersection_id] = float(sum(values) / len(values))
+
+        request = AnalysisRequest(
+            corridor_id="bee-ridge",
+            direction=direction,
+            ordered_intersections=ordered,
+            selected_intersections=ordered,
+            phase_group=phase_group,
+            moe_name=moe,
+            weekday_filter=sorted(weekdays),
+            hour_slot_filter=[f"{h:02d}:00" for h in range(hour_from, hour_to + 1)],
+            start_date=start_date,
+            end_date=end_date,
+        )
+        result = run_grouping_analysis(
+            request,
+            observations,
+            threshold=threshold,
+            labels_by_id=labels_by_id,
+        ).as_dict()
+        for group in result.get("groups", []):
+            group["member_details"] = [
+                {
+                    "id": member_id,
+                    "label": labels_by_id.get(member_id, member_id),
+                    "avg_moe": avg_moe_by_intersection.get(member_id),
+                }
+                for member_id in group.get("members", [])
+            ]
+        direction_results[direction.value] = result
+    return {
+        "ok": True,
+        "note": "Grouping preview is ready for the selected filter window.",
+        "request": {
+            "dateFrom": start_date.isoformat(),
+            "dateTo": end_date.isoformat(),
+            "daysOfWeek": sorted(weekdays),
+            "hourFrom": f"{hour_from:02d}:00",
+            "hourTo": f"{hour_to:02d}:00",
+            "moe": moe,
+            "threshold": threshold,
+            "selectedIntersectionIds": ordered,
+        },
+        "results": direction_results,
+    }
+
+
+def _parse_bottleneck_detection_moe(raw_moe: str | None) -> str:
+    if raw_moe in BOTTLENECK_DETECTION_MOE_CONFIG:
+        return raw_moe
+    return "aorPct"
+
+
+def _bottleneck_hour_slot(hour: int) -> str:
+    return f"{hour:02d}:00-{hour + 1:02d}:00"
+
+
+def _load_bottleneck_detection_observations(
+    signal_id: str,
+    *,
+    corridor_order: int,
+    direction: Direction,
+    moe: str,
+    start_date: date,
+    end_date: date,
+    weekdays: set[str],
+    hour_from: int,
+    hour_to: int,
+    phase: int,
+) -> list[RawObservation]:
+    sqlite_path = _grouping_sqlite_path(signal_id)
+    if not sqlite_path.exists():
+        return []
+
+    table, value_column, performance_measure = _grouping_metric_source(moe)
+    with sqlite3.connect(sqlite_path) as conn:
+        if not _sqlite_table_exists(conn, table):
+            return []
+
+    selected_columns = f"run_date, hour, DeviceId, Phase, {value_column} AS moe_value"
+    if table == "terminations":
+        selected_columns += ", PerformanceMeasure"
+    query_sql = f"""
+        SELECT {selected_columns}
+        FROM {table}
+        WHERE DeviceId = ?
+          AND run_date BETWEEN ? AND ?
+          AND hour BETWEEN ? AND ?
+          AND Phase = ?
+    """
+    params: list[Any] = [int(signal_id), start_date.isoformat(), end_date.isoformat(), hour_from, hour_to, phase]
+    if table == "terminations":
+        query_sql += " AND PerformanceMeasure = ?"
+        params.append(performance_measure)
+
+    with sqlite3.connect(sqlite_path) as conn:
+        frame = pd.read_sql_query(query_sql, conn, params=params)
+
+    if frame.empty:
+        return []
+
+    frame["run_date"] = pd.to_datetime(frame["run_date"], errors="coerce")
+    frame = frame.dropna(subset=["run_date", "moe_value"]).copy()
+    frame["weekday_full"] = frame["run_date"].dt.day_name()
+    frame = frame[frame["weekday_full"].isin(weekdays)].copy()
+    if frame.empty:
+        return []
+
+    first_week = frame["run_date"].dt.to_period("W-MON").min()
+    frame["week_id"] = frame["run_date"].dt.to_period("W-MON").map(lambda value: int(value.ordinal - first_week.ordinal + 1))
+    if moe == "aorPct":
+        frame["moe_value"] = frame["moe_value"].map(lambda value: 100.0 - float(value) * 100.0)
+    elif moe == "aogPct":
+        frame["moe_value"] = frame["moe_value"].map(lambda value: float(value) * 100.0)
+    elif moe in {"greenOccupancyPct", "redOccupancyPct"}:
+        frame["moe_value"] = frame["moe_value"].map(lambda value: float(value) * 100.0)
+    else:
+        frame["moe_value"] = frame["moe_value"].map(float)
+
+    observations: list[RawObservation] = []
+    for row in frame.itertuples():
+        hour = int(row.hour)
+        observations.append(
+            RawObservation(
+                intersection_id=str(signal_id),
+                corridor_order=corridor_order,
+                direction=direction,
+                week_id=int(row.week_id),
+                date=row.run_date.date(),
+                weekday=str(row.weekday_full)[:3],
+                hour_slot=_bottleneck_hour_slot(hour),
+                moe_name=moe,
+                raw_value=float(row.moe_value),
+            )
+        )
+    return observations
+
+
+def _plotly_json(figure: Any) -> dict[str, Any]:
+    return json.loads(figure.to_json())
+
+
+def _json_safe_default(value: Any) -> Any:
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
+def build_bottleneck_detection_payload(query: dict[str, list[str]]) -> dict[str, Any]:
+    available_dates = list(_raw_files().keys())
+    if not available_dates:
+        raise RuntimeError("No raw ATSPM files are available.")
+
+    default_date_from, default_date_to = _default_date_window(available_dates)
+    start_date = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    end_date = _safe_date(query.get("dateTo", [None])[0], default_date_to)
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    moe = _parse_bottleneck_detection_moe(query.get("moe", [None])[0])
+    config = BOTTLENECK_DETECTION_MOE_CONFIG[moe]
+    threshold = _parse_float_range(
+        query.get("threshold", [None])[0],
+        float(config["defaultThreshold"]),
+        -1_000_000.0,
+        1_000_000.0,
+    )
+    days_raw = query.get("daysOfWeek", [""])[0]
+    selected_days = [day for day in days_raw.split(",") if day in DAY_NAMES] if days_raw else WEEKDAY_NAMES
+    if not selected_days:
+        selected_days = WEEKDAY_NAMES
+    weekdays = {day for day in selected_days}
+    weekday_abbrevs = [day[:3] for day in DAY_NAMES if day in weekdays]
+
+    hour_from = _hour_label_to_int(query.get("hourFrom", ["06:00"])[0])
+    hour_to = _hour_label_to_int(query.get("hourTo", ["18:00"])[0])
+    if hour_to < hour_from:
+        hour_from, hour_to = hour_to, hour_from
+    hour_slots = [_bottleneck_hour_slot(hour) for hour in range(hour_from, hour_to + 1)]
+
+    corridor_inventory = _corridor_intersection_inventory()
+    selected_raw = query.get("intersectionIds", [""])[0]
+    selected_ids = [part for part in selected_raw.split(",") if part in INTERSECTION_LOOKUP] if selected_raw else [meta.id for meta in corridor_inventory]
+    ordered_ids = [meta.id for meta in corridor_inventory if meta.id in selected_ids]
+    labels_by_id = {meta.id: meta.name for meta in corridor_inventory}
+    short_labels_by_id = {
+        meta.id: _short_corridor_intersection_label(meta.name)
+        for meta in corridor_inventory
+    }
+    ordered_index = {signal_id: index for index, signal_id in enumerate(ordered_ids)}
+
+    spec = ThresholdSpec(
+        moe_name=moe,
+        threshold=threshold,
+        bad_direction=str(config["badDirection"]),
+        worst_ref=float(config["worstRef"]),
+    )
+
+    results: dict[str, Any] = {}
+    for direction, phase, label in (
+        (Direction.LR, 2, "Eastbound (Phase 2)"),
+        (Direction.RL, 6, "Westbound (Phase 6)"),
+    ):
+        observations: list[RawObservation] = []
+        for signal_id in ordered_ids:
+            observations.extend(
+                _load_bottleneck_detection_observations(
+                    signal_id,
+                    corridor_order=ordered_index[signal_id],
+                    direction=direction,
+                    moe=moe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    weekdays=weekdays,
+                    hour_from=hour_from,
+                    hour_to=hour_to,
+                    phase=phase,
+                )
+            )
+
+        request = BottleneckRequest(
+            corridor_id="bee-ridge",
+            direction=direction,
+            ordered_intersections=ordered_ids,
+            selected_intersections=ordered_ids,
+            phase_group=f"phase{phase}",
+            weekday_filter=weekday_abbrevs,
+            hour_slot_filter=hour_slots,
+            start_date=start_date,
+            end_date=end_date,
+            threshold_spec=spec,
+            min_weeks=1,
+        )
+        aggregated = bd.aggregate_by_slot(observations, request)
+        enriched = bd.apply_threshold(aggregated, spec)
+        volume = bd.build_intensity_volume(enriched, request, weekdays=weekday_abbrevs, hour_slots=hour_slots)
+        figure = _format_3d_corridor_figure(bd.render_bottleneck_volume(
+            volume,
+            spec,
+            intersection_labels=short_labels_by_id,
+            day_labels=weekday_abbrevs,
+            hour_start=hour_from,
+            direction_label=label,
+            moe_label=str(config["label"]),
+        ))
+        distribution = _format_bottleneck_distribution_figure(bd.render_worst_voxel_distribution(
+            volume,
+            spec,
+            intersection_labels=labels_by_id,
+            moe_label=str(config["label"]),
+            hour_start=hour_from,
+        ))
+        worst_slots_frame = enriched[enriched.get("is_bottleneck", False) == True].copy() if not enriched.empty else pd.DataFrame()
+        worst_slots: list[dict[str, Any]] = []
+        if not worst_slots_frame.empty:
+            worst_slots_frame["sortIntensity"] = pd.to_numeric(worst_slots_frame["intensity"], errors="coerce").fillna(0.0)
+            worst_slots_frame["sortPersistence"] = pd.to_numeric(worst_slots_frame["pct_exceeding"], errors="coerce").fillna(0.0)
+            worst_slots_frame["sortMean"] = pd.to_numeric(worst_slots_frame["mean_value"], errors="coerce").fillna(0.0)
+            worst_slots_frame = worst_slots_frame.sort_values(
+                ["sortIntensity", "sortPersistence", "sortMean"],
+                ascending=[False, False, False],
+            ).head(12)
+            for row in worst_slots_frame.itertuples():
+                weekly_values = [float(value) for value in getattr(row, "weekly_values", [])]
+                n_weeks = int(getattr(row, "n_weeks", 0))
+                pct_exceeding = float(getattr(row, "pct_exceeding", 0.0))
+                worst_slots.append(
+                    {
+                        "signalId": str(row.intersection_id),
+                        "intersection": labels_by_id.get(str(row.intersection_id), str(row.intersection_id)),
+                        "weekday": str(row.weekday),
+                        "hourSlot": str(row.hour_slot),
+                        "meanValue": round(float(row.mean_value), 2),
+                        "stdValue": round(float(row.std_value), 2),
+                        "nWeeks": n_weeks,
+                        "weeksExceeded": int(round(pct_exceeding * n_weeks)),
+                        "pctExceeded": round(pct_exceeding * 100.0, 1),
+                        "rawExcess": round(float(row.raw_excess), 2),
+                        "intensity": round(float(row.intensity), 3),
+                        "opacity": round(float(row.opacity), 3),
+                        "weeklyValues": [round(value, 2) for value in weekly_values],
+                    }
+                )
+        worst_voxel = volume.worst_voxel()
+        results[direction.value] = {
+            "direction": direction.value,
+            "label": label,
+            "phase": phase,
+            "observationCount": len(observations),
+            "slotCount": int(len(enriched)),
+            "bottleneckVoxelCount": volume.n_bottleneck_voxels,
+            "worstVoxel": [int(value) for value in worst_voxel] if worst_voxel is not None else None,
+            "figure": _plotly_json(figure),
+            "distributionFigure": _plotly_json(distribution),
+            "worstSlots": worst_slots,
+        }
+
+    return {
+        "ok": True,
+        "meta": {
+            "dataSource": "Precomputed historical SQLite MOE outputs",
+            "moeOptions": [
+                {
+                    "key": key,
+                    "label": str(value["label"]),
+                    "unit": str(value["unit"]),
+                    "badDirection": str(value["badDirection"]),
+                    "defaultThreshold": float(value["defaultThreshold"]),
+                    "worstRef": float(value["worstRef"]),
+                }
+                for key, value in BOTTLENECK_DETECTION_MOE_CONFIG.items()
+            ],
+            "availableSignals": _historical_available_signals(),
+        },
+        "filters": {
+            "dateFrom": start_date.isoformat(),
+            "dateTo": end_date.isoformat(),
+            "daysOfWeek": selected_days,
+            "hourFrom": f"{hour_from:02d}:00",
+            "hourTo": f"{hour_to:02d}:00",
+            "moe": moe,
+            "threshold": threshold,
+            "intersectionIds": ordered_ids,
+        },
+        "results": results,
+    }
+
+
+def _parse_correlation_clique_moe(raw_moe: str | None) -> str:
+    if raw_moe in BOTTLENECK_DETECTION_MOE_CONFIG:
+        return raw_moe
+    if raw_moe == "volume":
+        return "volume"
+    return "volume"
+
+
+def _load_correlation_clique_frame(
+    signal_id: str,
+    *,
+    corridor_order: int,
+    direction: Direction,
+    moe: str,
+    start_date: date,
+    end_date: date,
+    weekdays: set[str],
+    hour_from: int,
+    hour_to: int,
+    phase: int,
+) -> pd.DataFrame:
+    observations = _load_bottleneck_detection_observations(
+        signal_id,
+        corridor_order=corridor_order,
+        direction=direction,
+        moe=moe,
+        start_date=start_date,
+        end_date=end_date,
+        weekdays=weekdays,
+        hour_from=hour_from,
+        hour_to=hour_to,
+        phase=phase,
+    )
+    if not observations:
+        return pd.DataFrame(
+            columns=[
+                "intersection_id",
+                "direction",
+                "week_id",
+                "weekday",
+                "hour_slot",
+                "moe_name",
+                "raw_value",
+                "corridor_order",
+                "date",
+            ]
+        )
+    return pd.DataFrame(
+        [
+            {
+                "intersection_id": observation.intersection_id,
+                "direction": observation.direction.value,
+                "week_id": observation.week_id,
+                "weekday": observation.weekday,
+                "hour_slot": observation.hour_slot,
+                "moe_name": observation.moe_name,
+                "raw_value": observation.raw_value,
+                "corridor_order": observation.corridor_order,
+                "date": observation.date.isoformat(),
+            }
+            for observation in observations
+        ]
+    )
+
+
+def _correlation_clique_slot_summaries(
+    slot_results: dict[tuple[str, str], ccc.SlotCliqueResult],
+    labels_by_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for (weekday, hour_slot), result in slot_results.items():
+        if not result.groups:
+            continue
+        summaries.append(
+            {
+                "weekday": weekday,
+                "hourSlot": hour_slot,
+                "groupCount": len(result.groups),
+                "memberCount": len(result.members),
+                "pairCount": len(result.highly_correlated_pairs),
+                "nWeeks": result.n_weeks,
+                "groups": [
+                    {
+                        "members": group,
+                        "labels": [labels_by_id.get(member, member) for member in group],
+                    }
+                    for group in result.groups
+                ],
+            }
+        )
+    summaries.sort(key=lambda item: (item["weekday"], item["hourSlot"]))
+    return summaries[:24]
+
+
+def _short_corridor_intersection_label(name: str) -> str:
+    prefix = "SR 758 (Bee Ridge Rd) & "
+    if name.startswith(prefix):
+        return name[len(prefix):]
+    return name
+
+
+def _format_3d_corridor_figure(figure: Any) -> Any:
+    figure.update_layout(
+        scene={
+            "xaxis": {"title": {"text": ""}},
+            "yaxis": {"title": {"text": ""}},
+            "zaxis": {"title": {"text": ""}},
+        }
+    )
+    return figure
+
+
+def _format_bottleneck_distribution_figure(figure: Any) -> Any:
+    annotations = [
+        annotation
+        for annotation in getattr(figure.layout, "annotations", ())
+        if not str(getattr(annotation, "text", "")).lower().startswith("threshold")
+    ]
+    figure.update_layout(showlegend=False, annotations=annotations)
+    return figure
+
+
+def _prepare_correlation_clique_frame(frame: pd.DataFrame, ordered_ids: list[str]) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    keys = ["intersection_id", "direction", "week_id", "weekday", "hour_slot", "moe_name"]
+    return (
+        frame.groupby(keys, as_index=False)
+        .agg({"raw_value": "mean", "corridor_order": "first", "date": "first"})
+    )
+
+
+def build_correlation_cliques_payload(query: dict[str, list[str]]) -> dict[str, Any]:
+    available_dates = list(_raw_files().keys())
+    if not available_dates:
+        raise RuntimeError("No raw ATSPM files are available.")
+
+    default_date_from, default_date_to = _default_date_window(available_dates)
+    start_date = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    end_date = _safe_date(query.get("dateTo", [None])[0], default_date_to)
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    days_raw = query.get("daysOfWeek", [""])[0]
+    selected_days = [day for day in days_raw.split(",") if day in DAY_NAMES] if days_raw else WEEKDAY_NAMES
+    if not selected_days:
+        selected_days = WEEKDAY_NAMES
+    weekdays = set(selected_days)
+    weekday_abbrevs = [day[:3] for day in DAY_NAMES if day in weekdays]
+
+    hour_from = _hour_label_to_int(query.get("hourFrom", ["06:00"])[0])
+    hour_to = _hour_label_to_int(query.get("hourTo", ["18:00"])[0])
+    if hour_to < hour_from:
+        hour_from, hour_to = hour_to, hour_from
+    hour_slots = [_bottleneck_hour_slot(hour) for hour in range(hour_from, hour_to + 1)]
+
+    threshold = _parse_float_range(query.get("threshold", [None])[0], ccc.DEFAULT_THRESHOLD, 0.0, 0.99)
+    moe = _parse_correlation_clique_moe(query.get("moe", [None])[0])
+
+    corridor_inventory = _corridor_intersection_inventory()
+    selected_raw = query.get("intersectionIds", [""])[0]
+    selected_ids = [part for part in selected_raw.split(",") if part in INTERSECTION_LOOKUP] if selected_raw else [meta.id for meta in corridor_inventory]
+    ordered_ids = [meta.id for meta in corridor_inventory if meta.id in selected_ids]
+    labels_by_id = {meta.id: meta.name for meta in corridor_inventory}
+    short_labels_by_id = {
+        meta.id: _short_corridor_intersection_label(meta.name)
+        for meta in corridor_inventory
+    }
+    ordered_index = {signal_id: index for index, signal_id in enumerate(ordered_ids)}
+
+    results: dict[str, Any] = {}
+    for direction, phase, label in (
+        (Direction.LR, 2, "Eastbound / Phase 2"),
+        (Direction.RL, 6, "Westbound / Phase 6"),
+    ):
+        frames: list[pd.DataFrame] = []
+        for signal_id in ordered_ids:
+            frame = _load_correlation_clique_frame(
+                signal_id,
+                corridor_order=ordered_index[signal_id],
+                direction=direction,
+                moe=moe,
+                start_date=start_date,
+                end_date=end_date,
+                weekdays=weekdays,
+                hour_from=hour_from,
+                hour_to=hour_to,
+                phase=phase,
+            )
+            if not frame.empty:
+                frames.append(frame)
+        clique_frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        clique_frame = _prepare_correlation_clique_frame(clique_frame, ordered_ids)
+        if clique_frame.empty:
+            figure = _format_3d_corridor_figure(ccc.render_voxel_volume(
+                ccc.build_clique_volume(
+                    pd.DataFrame(
+                        columns=["intersection_id", "direction", "week_id", "weekday", "hour_slot", "moe_name", "raw_value"]
+                    ),
+                    ordered_ids,
+                    direction=ccc.Direction(direction.value),
+                    weekdays=weekday_abbrevs,
+                    hour_slots=hour_slots,
+                    threshold=threshold,
+                    moe_name=moe,
+                ),
+                intersection_labels=[short_labels_by_id.get(intersection_id, intersection_id) for intersection_id in ordered_ids],
+                day_labels=weekday_abbrevs,
+                hour_start=hour_from,
+                title=f"{label} correlation cliques",
+            ))
+            slot_summaries: list[dict[str, Any]] = []
+            voxel_count = 0
+            week_count = 0
+        else:
+            volume_array = ccc.build_clique_volume(
+                clique_frame,
+                ordered_ids,
+                direction=ccc.Direction(direction.value),
+                weekdays=weekday_abbrevs,
+                hour_slots=hour_slots,
+                threshold=threshold,
+                moe_name=moe,
+            )
+            figure = _format_3d_corridor_figure(ccc.render_voxel_volume(
+                volume_array,
+                intersection_labels=[short_labels_by_id.get(intersection_id, intersection_id) for intersection_id in ordered_ids],
+                day_labels=weekday_abbrevs,
+                hour_start=hour_from,
+                title=f"{label} correlation cliques",
+            ))
+            slot_results = ccc.build_slot_results(
+                clique_frame,
+                ordered_ids,
+                direction=ccc.Direction(direction.value),
+                weekdays=weekday_abbrevs,
+                hour_slots=hour_slots,
+                threshold=threshold,
+                moe_name=moe,
+            )
+            slot_summaries = _correlation_clique_slot_summaries(slot_results, labels_by_id)
+            voxel_count = int(volume_array.sum())
+            week_count = int(clique_frame["week_id"].nunique())
+
+        results[direction.value] = {
+            "direction": direction.value,
+            "label": label,
+            "phase": phase,
+            "observationCount": int(len(clique_frame)) if not clique_frame.empty else 0,
+            "weekCount": week_count,
+            "voxelCount": voxel_count,
+            "figure": _plotly_json(figure),
+            "slotSummaries": slot_summaries,
+        }
+
+    return {
+        "ok": True,
+        "meta": {
+            "dataSource": "Precomputed historical SQLite MOE outputs",
+            "moeOptions": [
+                {"key": "volume", "label": "Volume", "description": BOTTLENECK_MOE_DEFINITIONS["volume"]},
+                *[
+                    {"key": key, "label": label, "description": BOTTLENECK_MOE_DEFINITIONS[key]}
+                    for key, label in BOTTLENECK_MOE_LABELS.items()
+                    if key != "volume"
+                ],
+            ],
+            "availableSignals": _historical_available_signals(),
+        },
+        "filters": {
+            "dateFrom": start_date.isoformat(),
+            "dateTo": end_date.isoformat(),
+            "daysOfWeek": selected_days,
+            "hourFrom": f"{hour_from:02d}:00",
+            "hourTo": f"{hour_to:02d}:00",
+            "moe": moe,
+            "threshold": threshold,
+            "intersectionIds": ordered_ids,
+        },
+        "results": results,
     }
 
 
@@ -2216,10 +3092,10 @@ def _build_bottleneck_change_detections(slot_vectors: pd.DataFrame, used_moes: l
 
 def build_ranking_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     available_dates = list(_raw_files().keys())
-    default_date = _default_analysis_date()
+    default_date_from, default_date_to = _default_date_window(available_dates)
 
-    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date)
-    date_to = _safe_date(query.get("dateTo", [None])[0], date_from)
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    date_to = _safe_date(query.get("dateTo", [None])[0], default_date_to)
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
@@ -2397,7 +3273,7 @@ def build_ranking_payload(query: dict[str, list[str]]) -> dict[str, Any]:
 
 def build_day_hour_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     available_dates = list(_raw_files().keys())
-    default_date = _default_analysis_date()
+    default_date_from, default_date_to = _default_date_window(available_dates)
 
     signal_id = _historical_signal_id(query.get("signalId", [None])[0])
     metric = str(query.get("metric", ["avgWait"])[0] or "avgWait")
@@ -2414,8 +3290,8 @@ def build_day_hour_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     if metric not in allowed_metrics:
         metric = "avgWait"
 
-    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date)
-    date_to = _safe_date(query.get("dateTo", [None])[0], date_from)
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    date_to = _safe_date(query.get("dateTo", [None])[0], default_date_to)
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
@@ -2701,7 +3577,7 @@ def _build_intersection_change_rows(
     hour_end: int,
     selected_date: date,
     selected_hour_label: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, list[float]]]:
     paths = _ensure_historical_db(signal_id)
     if not paths["sqlite_path"].exists():
         return [], {
@@ -2713,7 +3589,7 @@ def _build_intersection_change_rows(
             "status": "No data",
             "tone": "calm",
             "historyCount": 0,
-        }
+        }, {"historyValues": [], "currentValues": []}
 
     with sqlite3.connect(paths["sqlite_path"]) as conn:
         hourly = _change_detection_hourly_metric_points(conn, metric, date_from, date_to, hour_start, hour_end)
@@ -2728,7 +3604,7 @@ def _build_intersection_change_rows(
             "status": "No data",
             "tone": "calm",
             "historyCount": 0,
-        }
+        }, {"historyValues": [], "currentValues": []}
 
     hourly["run_date"] = pd.to_datetime(hourly["run_date"], errors="coerce")
     hourly = hourly.dropna(subset=["run_date", "value"]).copy()
@@ -2744,7 +3620,7 @@ def _build_intersection_change_rows(
             "status": "No data",
             "tone": "calm",
             "historyCount": 0,
-        }
+        }, {"historyValues": [], "currentValues": []}
 
     if granularity == "day":
         daily = (
@@ -2764,6 +3640,8 @@ def _build_intersection_change_rows(
 
     current_value = None if current.empty else float(current["value"].mean())
     historical_mean = None if prior.empty else float(prior["value"].mean())
+    history_values = [float(value) for value in prior["value"].dropna().tolist()]
+    current_values = [float(value) for value in current["value"].dropna().tolist()]
     history_count = int(len(prior))
     delta_pct = None
     status = "No data"
@@ -2814,6 +3692,99 @@ def _build_intersection_change_rows(
         "status": status,
         "tone": tone,
         "historyCount": history_count,
+    }, {"historyValues": history_values, "currentValues": current_values}
+
+
+def _quantile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    position = (len(sorted_values) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+
+def _build_distribution_summary(history_values: list[float], current_values: list[float]) -> dict[str, Any]:
+    clean_history = [float(value) for value in history_values if math.isfinite(float(value))]
+    clean_current = [float(value) for value in current_values if math.isfinite(float(value))]
+    combined = clean_history + clean_current
+    if not combined:
+        return {
+            "bins": [],
+            "historyValues": [],
+            "currentValues": [],
+            "historyCount": 0,
+            "currentCount": 0,
+            "currentMean": None,
+            "historicalMean": None,
+            "median": None,
+            "q1": None,
+            "q3": None,
+            "historyMin": None,
+            "historyMax": None,
+            "lowerFence": None,
+            "upperFence": None,
+            "min": None,
+            "max": None,
+        }
+
+    min_value = min(combined)
+    max_value = max(combined)
+    span = max(max_value - min_value, 1.0)
+    padding = span * 0.08
+    low = min_value - padding
+    high = max_value + padding
+    bin_count = min(14, max(6, int(math.sqrt(max(len(clean_history), 1)))))
+    width = (high - low) / bin_count
+    bins: list[dict[str, Any]] = []
+
+    for index in range(bin_count):
+        bin_low = low + index * width
+        bin_high = high if index == bin_count - 1 else bin_low + width
+        if index == bin_count - 1:
+            frequency = sum(1 for value in clean_history if bin_low <= value <= bin_high)
+        else:
+            frequency = sum(1 for value in clean_history if bin_low <= value < bin_high)
+        density = frequency / (len(clean_history) * width) if clean_history and width else 0.0
+        bins.append({
+            "label": f"{bin_low:.1f}-{bin_high:.1f}",
+            "low": round(bin_low, 4),
+            "high": round(bin_high, 4),
+            "midpoint": round((bin_low + bin_high) / 2, 4),
+            "frequency": frequency,
+            "density": round(density, 6),
+        })
+
+    historical_mean = sum(clean_history) / len(clean_history) if clean_history else None
+    current_mean = sum(clean_current) / len(clean_current) if clean_current else None
+    q1 = _quantile(clean_history, 0.25) if clean_history else None
+    median = _quantile(clean_history, 0.5) if clean_history else None
+    q3 = _quantile(clean_history, 0.75) if clean_history else None
+    iqr = (q3 - q1) if q1 is not None and q3 is not None else None
+    history_min = min(clean_history) if clean_history else None
+    history_max = max(clean_history) if clean_history else None
+    lower_fence = max(history_min, q1 - 1.5 * iqr) if history_min is not None and q1 is not None and iqr is not None else None
+    upper_fence = min(history_max, q3 + 1.5 * iqr) if history_max is not None and q3 is not None and iqr is not None else None
+
+    return {
+        "bins": bins,
+        "historyValues": [round(value, 4) for value in clean_history],
+        "currentValues": [round(value, 4) for value in clean_current],
+        "historyCount": len(clean_history),
+        "currentCount": len(clean_current),
+        "currentMean": None if current_mean is None else round(current_mean, 4),
+        "historicalMean": None if historical_mean is None else round(historical_mean, 4),
+        "median": None if median is None else round(median, 4),
+        "q1": None if q1 is None else round(q1, 4),
+        "q3": None if q3 is None else round(q3, 4),
+        "historyMin": None if history_min is None else round(history_min, 4),
+        "historyMax": None if history_max is None else round(history_max, 4),
+        "lowerFence": None if lower_fence is None else round(lower_fence, 4),
+        "upperFence": None if upper_fence is None else round(upper_fence, 4),
+        "min": round(low, 4),
+        "max": round(high, 4),
     }
 
 
@@ -2824,8 +3795,6 @@ def build_change_detection_payload(query: dict[str, list[str]]) -> dict[str, Any
 
     min_date = min(available_dates)
     max_date = max(available_dates)
-    date_from = min_date
-    date_to = max_date
 
     hour_start = 6
     hour_end = 21
@@ -2833,13 +3802,18 @@ def build_change_detection_payload(query: dict[str, list[str]]) -> dict[str, Any
     selected_moe = _parse_change_detection_moe(query.get("moe", [None])[0])
     granularity = _parse_change_detection_granularity(query.get("granularity", [None])[0])
     selected_date = _safe_date(query.get("selectedDate", [None])[0], max_date)
+    selected_date = min(max(selected_date, min_date), max_date)
+    date_to = selected_date
+    date_from = max(min_date, selected_date - timedelta(days=30))
     selected_hour = _parse_hour_label(query.get("selectedHour", [None])[0], "06:00")
 
     rows: list[dict[str, Any]] = []
     intersection_summaries: list[dict[str, Any]] = []
+    distribution_history_values: list[float] = []
+    distribution_current_values: list[float] = []
 
     for signal_id in selected_signal_ids:
-        signal_rows, signal_summary = _build_intersection_change_rows(
+        signal_rows, signal_summary, signal_distribution = _build_intersection_change_rows(
             signal_id,
             selected_moe,
             granularity,
@@ -2852,6 +3826,8 @@ def build_change_detection_payload(query: dict[str, list[str]]) -> dict[str, Any
         )
         rows.extend(signal_rows)
         intersection_summaries.append(signal_summary)
+        distribution_history_values.extend(signal_distribution["historyValues"])
+        distribution_current_values.extend(signal_distribution["currentValues"])
 
     total_points = len(rows)
     baseline_ready = sum(1 for row in rows if row["historicalMean"] is not None)
@@ -2924,6 +3900,7 @@ def build_change_detection_payload(query: dict[str, list[str]]) -> dict[str, Any
         },
         "intersectionSummaries": intersection_summaries,
         "mapStatuses": map_statuses,
+        "distribution": _build_distribution_summary(distribution_history_values, distribution_current_values),
         "availableDates": [value.isoformat() for value in available_dates],
         "availableHours": available_hours,
         "rows": rows,
@@ -2941,14 +3918,13 @@ def build_bottleneck_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     paths = _ensure_historical_db(signal_id)
     signal_meta = INTERSECTION_LOOKUP[signal_id]
 
-    min_date = min(available_dates)
-    max_date = max(available_dates)
-    date_from = _safe_date(query.get("dateFrom", [None])[0], min_date)
-    date_to = _safe_date(query.get("dateTo", [None])[0], max_date)
+    default_date_from, default_date_to = _default_date_window(available_dates)
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    date_to = _safe_date(query.get("dateTo", [None])[0], default_date_to)
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
-    days_of_week = DAY_NAMES
+    days_of_week = WEEKDAY_NAMES
     hour_start = 6
     hour_end = 21
     selected_moes = _parse_bottleneck_moes(query.get("moes", [None])[0])
@@ -3147,14 +4123,13 @@ def build_hdbscan_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     if not available_dates:
         raise RuntimeError("No raw ATSPM files are available.")
 
-    min_date = min(available_dates)
-    max_date = max(available_dates)
-    date_from = _safe_date(query.get("dateFrom", [None])[0], min_date)
-    date_to = _safe_date(query.get("dateTo", [None])[0], max_date)
+    default_date_from, default_date_to = _default_date_window(available_dates)
+    date_from = _safe_date(query.get("dateFrom", [None])[0], default_date_from)
+    date_to = _safe_date(query.get("dateTo", [None])[0], default_date_to)
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
-    days_of_week = DAY_NAMES
+    days_of_week = WEEKDAY_NAMES
     hour_start = 6
     hour_end = 21
     selected_signal_ids = _parse_signal_id_list(query.get("signalIds", [None])[0])
@@ -3330,7 +4305,7 @@ def build_hdbscan_payload(query: dict[str, list[str]]) -> dict[str, Any]:
 
 class ApiHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, default=_json_safe_default).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -3349,39 +4324,51 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
         if parsed.path == "/api/health":
             self._send_json({"ok": True})
             return
         if parsed.path == "/api/dashboard":
-            self._send_json(build_dashboard_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_dashboard_payload))
             return
         if parsed.path == "/api/historical-dashboard":
-            self._send_json(build_historical_dashboard_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_historical_dashboard_payload))
             return
         if parsed.path == "/api/ranking":
-            self._send_json(build_ranking_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_ranking_payload))
             return
         if parsed.path == "/api/day-hour":
-            self._send_json(build_day_hour_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_day_hour_payload))
+            return
+        if parsed.path == "/api/bottleneck-detection":
+            self._send_json(_cached_api_payload(parsed.path, query, build_bottleneck_detection_payload))
+            return
+        if parsed.path == "/api/correlation-cliques":
+            self._send_json(_cached_api_payload(parsed.path, query, build_correlation_cliques_payload))
             return
         if parsed.path == "/api/bottleneck-clusters":
-            self._send_json(build_bottleneck_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_bottleneck_payload))
             return
         if parsed.path == "/api/hdbscan-clusters":
-            self._send_json(build_hdbscan_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_hdbscan_payload))
             return
         if parsed.path == "/api/change-detection":
-            self._send_json(build_change_detection_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_change_detection_payload))
             return
         if parsed.path == "/api/historical-run":
-            self._send_json(build_historical_payload(parse_qs(parsed.query)))
+            self._send_json(_cached_api_payload(parsed.path, query, build_historical_payload))
+            return
+        if parsed.path == "/api/grouping-preview":
+            self._send_json(_cached_api_payload(parsed.path, query, build_grouping_preview_payload))
             return
         self._send_json({"error": "Not found"}, 404)
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), ApiHandler)
-    print("ATSPM backend listening on http://127.0.0.1:8000")
+    host = os.environ.get("ATSPM_BACKEND_HOST", "127.0.0.1")
+    port = int(os.environ.get("ATSPM_BACKEND_PORT", "8000"))
+    server = ThreadingHTTPServer((host, port), ApiHandler)
+    print(f"ATSPM backend listening on http://{host}:{port}")
     server.serve_forever()
 
 

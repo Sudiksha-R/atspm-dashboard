@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type ComponentType, type Dispatch, type SetStateAction } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ComponentType, type CSSProperties, type Dispatch, type SetStateAction } from "react";
 import { CircleMarker, MapContainer, Marker, Polyline, Popup, TileLayer, useMap } from "react-leaflet";
-import { divIcon, LatLngExpression } from "leaflet";
+import { divIcon, latLngBounds, LatLngExpression } from "leaflet";
 import createPlotlyComponent from "react-plotly.js/factory";
 import Plotly from "plotly.js-dist-min";
 import {
@@ -20,7 +20,11 @@ import {
 } from "recharts";
 
 const Plot = createPlotlyComponent(Plotly as never) as ComponentType<Record<string, unknown>>;
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000").replace(/\/$/, "");
+const apiUrl = (path: string, params: URLSearchParams) => `${API_BASE_URL}${path}?${params.toString()}`;
+const SHOW_CLUSTER_TABS = false;
+const GROUPING_PALETTE = ["#6a3d9a", "#e6550d", "#1f78b4", "#c51b8a", "#b15928", "#252525"];
+const GROUPING_UNGROUPED = "#9aa0a6";
 
 type MetricCard = {
   id: string;
@@ -278,6 +282,130 @@ type DayHourResponse = {
   hours: string[];
   days: string[];
   cells: DayHourCell[];
+};
+
+type PlotlyFigureJson = {
+  data: unknown[];
+  layout?: Record<string, unknown>;
+  frames?: unknown[];
+};
+
+type BottleneckDetectionResponse = {
+  ok: boolean;
+  meta: {
+    dataSource: string;
+    availableSignals: Array<{
+      id: string;
+      name: string;
+      route: string;
+      region: string;
+      lat: number;
+      lon: number;
+    }>;
+    moeOptions: Array<{
+      key: Exclude<RankingMetricKey, "compositeScore">;
+      label: string;
+      unit: string;
+      badDirection: "above" | "below";
+      defaultThreshold: number;
+      worstRef: number;
+    }>;
+  };
+  filters: {
+    dateFrom: string;
+    dateTo: string;
+    daysOfWeek: string[];
+    hourFrom: string;
+    hourTo: string;
+    moe: Exclude<RankingMetricKey, "compositeScore">;
+    threshold: number;
+    intersectionIds: string[];
+  };
+  results: Record<
+    "LR" | "RL",
+    {
+      direction: "LR" | "RL";
+      label: string;
+      phase: number;
+      observationCount: number;
+      slotCount: number;
+      bottleneckVoxelCount: number;
+      worstVoxel: number[] | null;
+      figure: PlotlyFigureJson;
+      distributionFigure: PlotlyFigureJson;
+      worstSlots: Array<{
+        signalId: string;
+        intersection: string;
+        weekday: string;
+        hourSlot: string;
+        meanValue: number;
+        stdValue: number;
+        nWeeks: number;
+        weeksExceeded: number;
+        pctExceeded: number;
+        rawExcess: number;
+        intensity: number;
+        opacity: number;
+        weeklyValues: number[];
+      }>;
+    }
+  >;
+};
+
+type CorrelationCliqueMoeKey = Exclude<RankingMetricKey, "compositeScore"> | "volume";
+
+type CorrelationCliquesResponse = {
+  ok: boolean;
+  meta: {
+    dataSource: string;
+    moeOptions: Array<{
+      key: CorrelationCliqueMoeKey;
+      label: string;
+      description: string;
+    }>;
+    availableSignals: Array<{
+      id: string;
+      name: string;
+      route: string;
+      region: string;
+      lat: number;
+      lon: number;
+    }>;
+  };
+  filters: {
+    dateFrom: string;
+    dateTo: string;
+    daysOfWeek: string[];
+    hourFrom: string;
+    hourTo: string;
+    moe: CorrelationCliqueMoeKey;
+    threshold: number;
+    intersectionIds: string[];
+  };
+  results: Record<
+    "LR" | "RL",
+    {
+      direction: "LR" | "RL";
+      label: string;
+      phase: number;
+      observationCount: number;
+      weekCount: number;
+      voxelCount: number;
+      figure: PlotlyFigureJson;
+      slotSummaries: Array<{
+        weekday: string;
+        hourSlot: string;
+        groupCount: number;
+        memberCount: number;
+        pairCount: number;
+        nWeeks: number;
+        groups: Array<{
+          members: string[];
+          labels: string[];
+        }>;
+      }>;
+    }
+  >;
 };
 
 type BottleneckSlot = {
@@ -542,9 +670,91 @@ type ChangeDetectionResponse = {
   }>;
   availableDates: string[];
   availableHours: string[];
+  distribution: {
+    bins: Array<{
+      label: string;
+      low: number;
+      high: number;
+      midpoint: number;
+      frequency: number;
+      density: number;
+    }>;
+    historyValues: number[];
+    currentValues: number[];
+    historyCount: number;
+    currentCount: number;
+    currentMean: number | null;
+    historicalMean: number | null;
+    median: number | null;
+    q1: number | null;
+    q3: number | null;
+    historyMin: number | null;
+    historyMax: number | null;
+    lowerFence: number | null;
+    upperFence: number | null;
+    min: number | null;
+    max: number | null;
+  };
   rows: ChangeDetectionRow[];
   slotRows: ChangeDetectionRow[];
   topChanges: ChangeDetectionRow[];
+};
+
+type GroupingPreviewResponse = {
+  ok: boolean;
+  note?: string;
+  message?: string;
+  request?: {
+    dateFrom: string;
+    dateTo: string;
+    daysOfWeek: string[];
+    hourFrom: string;
+    hourTo: string;
+    moe: string;
+    threshold: number;
+    selectedIntersectionIds: string[];
+  };
+  results?: Record<
+    string,
+    {
+      direction: string;
+      phase_group: string;
+      moe_name: string;
+      metric: string;
+      threshold: number;
+      n_intersections: number;
+      highly_correlated_pairs: Array<{
+        a: string;
+        b: string;
+        labels: string[];
+        spearman_rho: number;
+      }>;
+      groups: Array<{
+        group_id: string;
+        direction: string;
+        phase_group: string;
+        members: string[];
+        member_labels: string[];
+        member_details?: Array<{
+          id: string;
+          label: string;
+          avg_moe: number | null;
+        }>;
+        corridor_order_span: number[];
+        size: number;
+        internal_pairs: Array<{
+          a: string;
+          b: string;
+          labels: string[];
+          spearman_rho: number;
+        }>;
+        min_internal_rho: number;
+        mean_internal_rho: number;
+        max_internal_rho: number;
+      }>;
+      ungrouped: string[];
+    }
+  >;
 };
 
 type FilterState = {
@@ -556,6 +766,30 @@ type FilterState = {
   timeOfDayPreset: string;
   selectedPhase: string;
 };
+
+function buildDensityCurve(values: number[]) {
+  const clean = values.filter((value) => Number.isFinite(value));
+  if (clean.length < 2) {
+    return [];
+  }
+  const mean = clean.reduce((sum, value) => sum + value, 0) / clean.length;
+  const variance = clean.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, clean.length - 1);
+  const stdDev = Math.sqrt(variance);
+  const min = Math.min(...clean);
+  const max = Math.max(...clean);
+  const span = Math.max(max - min, 1);
+  const bandwidth = Math.max(1.06 * (stdDev || span / 6) * clean.length ** -0.2, span / 80);
+  const start = min - span * 0.08;
+  const end = max + span * 0.08;
+  const steps = 96;
+  const normalizer = clean.length * bandwidth * Math.sqrt(2 * Math.PI);
+
+  return Array.from({ length: steps }, (_, index) => {
+    const x = start + ((end - start) * index) / (steps - 1);
+    const y = clean.reduce((sum, value) => sum + Math.exp(-0.5 * ((x - value) / bandwidth) ** 2), 0) / normalizer;
+    return { x, y };
+  });
+}
 
 type RankedIntersection = IntersectionPayload & {
   rank: number | null;
@@ -615,6 +849,35 @@ function buildRankMarkerIcon(rank: number | null, total: number, active: boolean
   });
 }
 
+function buildGroupingMarkerIcon(colors: string[]) {
+  const uniqueColors = Array.from(new Set(colors));
+  if (!uniqueColors.length) {
+    return divIcon({
+      className: "intersection-pin-shell",
+      html: `<span class="map-pin map-pin--grouped" style="background:${GROUPING_UNGROUPED}"></span>`,
+      iconSize: [26, 26],
+      iconAnchor: [13, 13]
+    });
+  }
+  const background =
+    uniqueColors.length === 1
+      ? uniqueColors[0]
+      : `conic-gradient(${uniqueColors
+          .map((color, index) => {
+            const start = Math.round((index / uniqueColors.length) * 100);
+            const end = Math.round(((index + 1) / uniqueColors.length) * 100);
+            return `${color} ${start}% ${end}%`;
+          })
+          .join(", ")})`;
+
+  return divIcon({
+    className: "intersection-pin-shell",
+    html: `<span class="map-pin map-pin--grouped" style="background:${background}"></span>`,
+    iconSize: [26, 26],
+    iconAnchor: [13, 13]
+  });
+}
+
 function rankColorParts(rank: number | null, total: number) {
   if (rank === null || total <= 0) {
       return {
@@ -665,6 +928,28 @@ function RankingMapFocus({ center, zoom }: { center: LatLngExpression; zoom: num
   useEffect(() => {
     map.setView(center, zoom, { animate: true });
   }, [center, map, zoom]);
+
+  return null;
+}
+
+function MapBoundsFocus({ points, fallbackCenter, fallbackZoom = 13 }: { points: LatLngExpression[]; fallbackCenter: LatLngExpression; fallbackZoom?: number }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (points.length === 1) {
+      map.setView(points[0], 16, { animate: true });
+      return;
+    }
+    if (points.length > 1) {
+      map.fitBounds(latLngBounds(points), {
+        animate: true,
+        maxZoom: 15,
+        padding: [36, 36],
+      });
+      return;
+    }
+    map.setView(fallbackCenter, fallbackZoom, { animate: true });
+  }, [fallbackCenter, fallbackZoom, map, points]);
 
   return null;
 }
@@ -2033,6 +2318,14 @@ function DayHourView({
     (hoveredDay && hoveredHour !== null ? cellLookup.get(`${hoveredDay}-${hoveredHour}`) : null) ??
     hottestCells[0] ??
     null;
+  const selectedSignalForMap =
+    (dayHour?.signal.id === selectedSignalId ? dayHour.signal : null) ??
+    dayHour?.meta.availableSignals.find((signal) => signal.id === selectedSignalId) ??
+    dayHour?.signal ??
+    null;
+  const dayHourMapCenter: LatLngExpression = selectedSignalForMap
+    ? [selectedSignalForMap.lat, selectedSignalForMap.lon]
+    : [27.2989, -82.48];
 
   const heatColor = (value: number | null) => {
     if (value === null) {
@@ -2160,28 +2453,29 @@ function DayHourView({
             <div className="section-header compact">
               <div>
                 <p className="section-kicker">Map</p>
-                <h2>{dayHour?.signal.name ?? "Selected intersection"}</h2>
+                <h2>{selectedSignalForMap?.name ?? "Selected intersection"}</h2>
               </div>
-              <p className="section-copy">The map follows the selected historical signal so the day-hour matrix stays tied to one physical location.</p>
+              <p className="section-copy">The map zooms to the selected intersection used for the day-hour matrix.</p>
             </div>
             <div className="historical-map-frame">
               <MapContainer
                 key={`day-hour-map-${selectedSignalId}`}
-                center={dayHour?.signal ? [dayHour.signal.lat, dayHour.signal.lon] : [28.54, -81.37]}
-                zoom={15}
+                center={dayHourMapCenter}
+                zoom={17}
                 scrollWheelZoom={false}
                 className="historical-leaflet-map"
               >
+                <RankingMapFocus center={dayHourMapCenter} zoom={17} />
                 <TileLayer
                   attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                   url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 />
-                {dayHour?.signal ? (
-                  <Marker position={[dayHour.signal.lat, dayHour.signal.lon]}>
+                {selectedSignalForMap ? (
+                  <Marker position={[selectedSignalForMap.lat, selectedSignalForMap.lon]}>
                     <Popup>
-                      <strong>{dayHour.signal.name}</strong>
+                      <strong>{selectedSignalForMap.name}</strong>
                       <br />
-                      Signal ID {dayHour.signal.id}
+                      Signal ID {selectedSignalForMap.id}
                     </Popup>
                   </Marker>
                 ) : null}
@@ -2443,6 +2737,531 @@ function clusterTone(clusterId: number | null, sampleCount: number, isOutlier: b
   }
   const palette = ["#e8f0ff", "#f4e7ff", "#e7f8f0", "#fff0dc", "#fce5ef", "#e7f5fb", "#efeccf"];
   return palette[Math.abs(clusterId) % palette.length];
+}
+
+function BottleneckDetectionView({
+  data,
+  loading,
+  error,
+  filters,
+  setFilters,
+  availableDays,
+  availableDates,
+  maxAvailableDate,
+  selectedMoe,
+  onMoeChange,
+  threshold,
+  onThresholdChange,
+}: {
+  data: BottleneckDetectionResponse | null;
+  loading: boolean;
+  error: string | null;
+  filters: FilterState;
+  setFilters: Dispatch<SetStateAction<FilterState>>;
+  availableDays: string[];
+  availableDates: string[];
+  maxAvailableDate?: string;
+  selectedMoe: Exclude<RankingMetricKey, "compositeScore">;
+  onMoeChange: (value: Exclude<RankingMetricKey, "compositeScore">) => void;
+  threshold: string;
+  onThresholdChange: (value: string) => void;
+}) {
+  const moeOptions = data?.meta.moeOptions ?? [
+    { key: "aorPct" as const, label: "AOR %", unit: "%", badDirection: "above" as const, defaultThreshold: 60, worstRef: 100 },
+    { key: "aogPct" as const, label: "AOG %", unit: "%", badDirection: "below" as const, defaultThreshold: 40, worstRef: 0 },
+    { key: "avgWait" as const, label: "Avg Wait", unit: "sec", badDirection: "above" as const, defaultThreshold: 55, worstRef: 180 },
+    { key: "maxOuts" as const, label: "Max-Outs", unit: "per hr", badDirection: "above" as const, defaultThreshold: 5, worstRef: 30 },
+    { key: "forceOffs" as const, label: "Force-Offs", unit: "per hr", badDirection: "above" as const, defaultThreshold: 5, worstRef: 30 },
+  ];
+  const selectedOption = moeOptions.find((option) => option.key === selectedMoe) ?? moeOptions[0];
+  const directionResults = [
+    { key: "LR" as const, title: "West-to-east", subtitle: "Eastbound / Phase 2" },
+    { key: "RL" as const, title: "East-to-west", subtitle: "Westbound / Phase 6" },
+  ];
+
+  return (
+    <main className="workspace ranking-workspace">
+      {error ? <div className="status-banner error">{error}</div> : null}
+      {loading ? <div className="status-banner">Building threshold bottleneck volumes from historical MOE outputs...</div> : null}
+
+      <section className="filters-panel">
+        <div className="section-header">
+          <div>
+            <p className="section-kicker">Bottleneck Detection</p>
+            <h2>Threshold-based 3D bottleneck volume</h2>
+          </div>
+          <p className="section-copy">
+            Color shows severity past the threshold; opacity shows how persistent the exceedance is across weeks.
+          </p>
+        </div>
+
+        <div className="filters-grid filters-grid-v1">
+          <label>
+            <span>Date from</span>
+            <input
+              type="date"
+              value={filters.dateFrom}
+              min={availableDates[0]}
+              max={maxAvailableDate}
+              onChange={(event) => setFilters((current) => ({ ...current, dateFrom: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>Date to</span>
+            <input
+              type="date"
+              value={filters.dateTo}
+              min={availableDates[0]}
+              max={maxAvailableDate}
+              onChange={(event) => setFilters((current) => ({ ...current, dateTo: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>Hour from</span>
+            <CustomSelect
+              value={filters.hourFrom}
+              options={hourOptions.map((hour) => ({ value: hour, label: hour }))}
+              onChange={(nextValue) => setFilters((current) => ({ ...current, hourFrom: nextValue, timeOfDayPreset: "custom" }))}
+              panelClassName="custom-select-panel--hours"
+            />
+          </label>
+          <label>
+            <span>Hour to</span>
+            <CustomSelect
+              value={filters.hourTo}
+              options={hourOptions.map((hour) => ({ value: hour, label: hour }))}
+              onChange={(nextValue) => setFilters((current) => ({ ...current, hourTo: nextValue, timeOfDayPreset: "custom" }))}
+              panelClassName="custom-select-panel--hours"
+            />
+          </label>
+          <label>
+            <span>Threshold</span>
+            <input
+              type="number"
+              step="0.1"
+              value={threshold}
+              onChange={(event) => onThresholdChange(event.target.value)}
+            />
+          </label>
+          <div className="filter-summary">
+            <p className="filter-summary-label">Threshold meaning</p>
+            <p>{selectedOption.badDirection === "above" ? "High values are bad" : "Low values are bad"}</p>
+            <strong>{selectedOption.label} {selectedOption.badDirection === "above" ? "≥" : "≤"} {threshold}{selectedOption.unit}</strong>
+          </div>
+        </div>
+
+        <div className="days-row">
+          <p className="filter-summary-label">MOE</p>
+          <div className="day-chip-row">
+            {moeOptions.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={`day-chip bottleneck-moe-chip ${selectedMoe === option.key ? "active" : ""}`}
+                onClick={() => {
+                  onMoeChange(option.key);
+                  onThresholdChange(String(option.defaultThreshold));
+                }}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="days-row">
+          <p className="filter-summary-label">Days of Week</p>
+          <div className="day-chip-row">
+            {availableDays.map((day) => {
+              const active = filters.daysOfWeek.includes(day);
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  className={`day-chip ${active ? "active" : ""}`}
+                  onClick={() =>
+                    setFilters((current) => {
+                      if (active && current.daysOfWeek.length === 1) {
+                        return current;
+                      }
+                      return {
+                        ...current,
+                        daysOfWeek: active ? current.daysOfWeek.filter((item) => item !== day) : [...current.daysOfWeek, day],
+                      };
+                    })
+                  }
+                >
+                  {day.slice(0, 2)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      <section className="bottleneck-volume-grid">
+        {directionResults.map((direction) => {
+          const result = data?.results?.[direction.key];
+          return (
+            <article key={direction.key} className="panel bottleneck-volume-panel">
+              <div className="section-header compact">
+                <div>
+                  <p className="section-kicker">{direction.title}</p>
+                  <h2>{direction.subtitle}</h2>
+                </div>
+                <p className="section-copy">
+                  {result
+                    ? `${result.bottleneckVoxelCount} bottleneck voxels from ${result.observationCount} observations.`
+                    : "Waiting for bottleneck volume."}
+                </p>
+              </div>
+              {result ? (
+                <Plot
+                  data={result.figure.data}
+                  layout={{
+                    ...(result.figure.layout ?? {}),
+                    autosize: true,
+                    height: 560,
+                    margin: { l: 0, r: 0, t: 70, b: 0 },
+                  }}
+                  config={{ responsive: true, displaylogo: false }}
+                  className="bottleneck-plot"
+                />
+              ) : (
+                <div className="empty-chart">No bottleneck volume loaded.</div>
+              )}
+            </article>
+          );
+        })}
+      </section>
+
+      <section className="bottleneck-volume-grid">
+        {directionResults.map((direction) => {
+          const result = data?.results?.[direction.key];
+          return (
+            <article key={`${direction.key}-dist`} className="panel bottleneck-volume-panel">
+              <div className="section-header compact">
+                <div>
+                  <p className="section-kicker">Worst Slot Distribution</p>
+                  <h2>{direction.subtitle}</h2>
+                </div>
+              </div>
+              {result ? (
+                <Plot
+                  data={result.distributionFigure.data}
+                  layout={{
+                    ...(result.distributionFigure.layout ?? {}),
+                    autosize: true,
+                    height: 360,
+                    margin: { l: 50, r: 20, t: 80, b: 50 },
+                  }}
+                  config={{ responsive: true, displaylogo: false }}
+                  className="bottleneck-plot"
+                />
+              ) : (
+                <div className="empty-chart">No distribution loaded.</div>
+              )}
+            </article>
+          );
+        })}
+      </section>
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <p className="section-kicker">Worst Bottleneck Slots</p>
+            <h2>Highest severity threshold crossings</h2>
+          </div>
+          <p className="section-copy">
+            Rows are ranked by severity first, then persistence across weeks.
+          </p>
+        </div>
+        <div className="bottleneck-worst-grid">
+          {directionResults.map((direction) => {
+            const result = data?.results?.[direction.key];
+            return (
+              <article key={`${direction.key}-worst`} className="bottleneck-worst-card">
+                <div className="grouping-cluster-card__top">
+                  <strong>{direction.subtitle}</strong>
+                  <span>{result?.worstSlots.length ?? 0} slots</span>
+                </div>
+                {result?.worstSlots.length ? (
+                  <div className="bottleneck-worst-table">
+                    <div className="bottleneck-worst-table__head">
+                      <span>Signal</span>
+                      <span>Intersection</span>
+                      <span>Slot</span>
+                      <span>Mean</span>
+                      <span>Excess</span>
+                      <span>Weeks</span>
+                    </div>
+                    {result.worstSlots.map((slot) => (
+                      <div key={`${direction.key}-${slot.signalId}-${slot.weekday}-${slot.hourSlot}`} className="bottleneck-worst-row">
+                        <strong>{slot.signalId}</strong>
+                        <span>{slot.intersection}</span>
+                        <span>{slot.weekday} {slot.hourSlot}</span>
+                        <span>{slot.meanValue.toFixed(2)}</span>
+                        <span>{slot.rawExcess.toFixed(2)}</span>
+                        <span>{slot.weeksExceeded}/{slot.nWeeks}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="list-note">No bottleneck slots crossed the current threshold.</p>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function CorrelationCliquesView({
+  data,
+  loading,
+  error,
+  filters,
+  setFilters,
+  availableDays,
+  availableDates,
+  maxAvailableDate,
+  selectedMoe,
+  onMoeChange,
+  threshold,
+  onThresholdChange,
+}: {
+  data: CorrelationCliquesResponse | null;
+  loading: boolean;
+  error: string | null;
+  filters: FilterState;
+  setFilters: Dispatch<SetStateAction<FilterState>>;
+  availableDays: string[];
+  availableDates: string[];
+  maxAvailableDate?: string;
+  selectedMoe: CorrelationCliqueMoeKey;
+  onMoeChange: (value: CorrelationCliqueMoeKey) => void;
+  threshold: string;
+  onThresholdChange: (value: string) => void;
+}) {
+  const moeOptions = data?.meta.moeOptions ?? [
+    { key: "volume" as const, label: "Volume", description: "Hourly detector actuation volume." },
+    { key: "aogPct" as const, label: "AOG %", description: "Arrival on green percentage." },
+    { key: "aorPct" as const, label: "AOR %", description: "Arrival on red percentage." },
+    { key: "avgWait" as const, label: "Avg Wait", description: "Average phase wait in seconds." },
+    { key: "maxOuts" as const, label: "Max-Outs", description: "Hourly Max-Out count." },
+    { key: "forceOffs" as const, label: "Force-Offs", description: "Hourly Force-Off count." },
+  ];
+  const selectedOption = moeOptions.find((option) => option.key === selectedMoe) ?? moeOptions[0];
+  const directionResults = [
+    { key: "LR" as const, title: "West-to-east", subtitle: "Eastbound / Phase 2" },
+    { key: "RL" as const, title: "East-to-west", subtitle: "Westbound / Phase 6" },
+  ];
+
+  return (
+    <main className="workspace ranking-workspace">
+      {error ? <div className="status-banner error">{error}</div> : null}
+      {loading ? <div className="status-banner">Building correlation clique voxel volumes from historical MOE outputs...</div> : null}
+
+      <section className="filters-panel">
+        <div className="section-header">
+          <div>
+            <p className="section-kicker">Correlation Cliques</p>
+            <h2>Week-over-week corridor synchrony</h2>
+          </div>
+          <p className="section-copy">
+            Voxels mark intersections that are inside a contiguous correlation clique for a specific weekday and hour.
+          </p>
+        </div>
+
+        <div className="filters-grid filters-grid-v1">
+          <label>
+            <span>Date from</span>
+            <input
+              type="date"
+              value={filters.dateFrom}
+              min={availableDates[0]}
+              max={maxAvailableDate}
+              onChange={(event) => setFilters((current) => ({ ...current, dateFrom: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>Date to</span>
+            <input
+              type="date"
+              value={filters.dateTo}
+              min={availableDates[0]}
+              max={maxAvailableDate}
+              onChange={(event) => setFilters((current) => ({ ...current, dateTo: event.target.value }))}
+            />
+          </label>
+          <label>
+            <span>Hour from</span>
+            <CustomSelect
+              value={filters.hourFrom}
+              options={hourOptions.map((hour) => ({ value: hour, label: hour }))}
+              onChange={(nextValue) => setFilters((current) => ({ ...current, hourFrom: nextValue, timeOfDayPreset: "custom" }))}
+              panelClassName="custom-select-panel--hours"
+            />
+          </label>
+          <label>
+            <span>Hour to</span>
+            <CustomSelect
+              value={filters.hourTo}
+              options={hourOptions.map((hour) => ({ value: hour, label: hour }))}
+              onChange={(nextValue) => setFilters((current) => ({ ...current, hourTo: nextValue, timeOfDayPreset: "custom" }))}
+              panelClassName="custom-select-panel--hours"
+            />
+          </label>
+          <label>
+            <span>Correlation threshold</span>
+            <input
+              type="number"
+              min="0"
+              max="0.99"
+              step="0.01"
+              value={threshold}
+              onChange={(event) => onThresholdChange(event.target.value)}
+            />
+          </label>
+          <div className="filter-summary">
+            <p className="filter-summary-label">Threshold meaning</p>
+            <p>Spearman rho for each weekday/hour slot.</p>
+            <strong>{selectedOption.label} pairs must be ≥ {threshold}</strong>
+          </div>
+        </div>
+
+        <div className="days-row">
+          <p className="filter-summary-label">MOE</p>
+          <div className="day-chip-row">
+            {moeOptions.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={`day-chip bottleneck-moe-chip ${selectedMoe === option.key ? "active" : ""}`}
+                onClick={() => onMoeChange(option.key)}
+                title={option.description}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="days-row">
+          <p className="filter-summary-label">Days of Week</p>
+          <div className="day-chip-row">
+            {availableDays.map((day) => {
+              const active = filters.daysOfWeek.includes(day);
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  className={`day-chip ${active ? "active" : ""}`}
+                  onClick={() =>
+                    setFilters((current) => {
+                      if (active && current.daysOfWeek.length === 1) {
+                        return current;
+                      }
+                      return {
+                        ...current,
+                        daysOfWeek: active ? current.daysOfWeek.filter((item) => item !== day) : [...current.daysOfWeek, day],
+                      };
+                    })
+                  }
+                >
+                  {day.slice(0, 2)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      <section className="bottleneck-volume-grid">
+        {directionResults.map((direction) => {
+          const result = data?.results?.[direction.key];
+          return (
+            <article key={direction.key} className="panel bottleneck-volume-panel">
+              <div className="section-header compact">
+                <div>
+                  <p className="section-kicker">{direction.title}</p>
+                  <h2>{direction.subtitle}</h2>
+                </div>
+                <p className="section-copy">
+                  {result
+                    ? `${result.voxelCount} clique voxels from ${result.observationCount} observations across ${result.weekCount} weeks.`
+                    : "Waiting for clique volume."}
+                </p>
+              </div>
+              {result ? (
+                <Plot
+                  data={result.figure.data}
+                  layout={{
+                    ...(result.figure.layout ?? {}),
+                    autosize: true,
+                    height: 560,
+                    margin: { l: 0, r: 0, t: 70, b: 0 },
+                  }}
+                  config={{ responsive: true, displaylogo: false }}
+                  className="bottleneck-plot"
+                />
+              ) : (
+                <div className="empty-chart">No correlation clique volume loaded.</div>
+              )}
+            </article>
+          );
+        })}
+      </section>
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <p className="section-kicker">Clique Slots</p>
+            <h2>Weekday-hour slots with contiguous cliques</h2>
+          </div>
+          <p className="section-copy">
+            These are the first slots where at least one contiguous clique was detected at the current threshold.
+          </p>
+        </div>
+        <div className="correlation-summary-grid">
+          {directionResults.map((direction) => {
+            const result = data?.results?.[direction.key];
+            return (
+              <article key={`${direction.key}-slots`} className="bottleneck-worst-card">
+                <div className="grouping-cluster-card__top">
+                  <strong>{direction.subtitle}</strong>
+                  <span>{result?.slotSummaries.length ?? 0} slots</span>
+                </div>
+                {result?.slotSummaries.length ? (
+                  <div className="correlation-slot-list">
+                    {result.slotSummaries.map((slot) => (
+                      <div key={`${direction.key}-${slot.weekday}-${slot.hourSlot}`} className="correlation-slot-row">
+                        <div>
+                          <strong>{slot.weekday} {slot.hourSlot}</strong>
+                          <span>{slot.groupCount} groups · {slot.memberCount} members · {slot.pairCount} pairs</span>
+                        </div>
+                        <div className="correlation-slot-groups">
+                          {slot.groups.map((group, index) => (
+                            <span key={`${slot.weekday}-${slot.hourSlot}-${index}`}>
+                              {group.labels.join(" → ")}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="history-note">No contiguous cliques found for this direction at the current threshold.</p>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </section>
+    </main>
+  );
 }
 
 function BottleneckClusterView({
@@ -3300,6 +4119,42 @@ function ChangeDetectionView({
   const slotRows = data?.slotRows ?? [];
   const selectedMoeLabel =
     data?.meta.moeOptions.find((option) => option.key === selectedMoe)?.label ?? selectedMoe;
+  const changeIntensityStyle = (deltaPct: number | null): CSSProperties => {
+    if (deltaPct == null || !Number.isFinite(deltaPct)) {
+      return {};
+    }
+    const magnitude = Math.min(Math.abs(deltaPct), 50) / 50;
+    const alpha = 0.08 + magnitude * 0.34;
+    const borderAlpha = 0.2 + magnitude * 0.42;
+    const positive = deltaPct >= 0;
+    return {
+      background: positive
+        ? `rgba(104, 167, 126, ${alpha})`
+        : `rgba(201, 131, 88, ${alpha})`,
+      boxShadow: `inset 4px 0 0 ${positive ? `rgba(65, 132, 86, ${borderAlpha})` : `rgba(184, 92, 48, ${borderAlpha})`}`,
+    };
+  };
+  const allSignalIds = useMemo(() => availableSignals.map((signal) => signal.id), [availableSignals]);
+  const visiblePresets = useMemo(() => {
+    const presets = data?.meta.selectionPresets ?? [];
+    return presets.filter((preset, index) => preset.label === "All signals" || (index >= 3 && index < presets.length - 3));
+  }, [data?.meta.selectionPresets]);
+
+  const applySelectionPreset = (presetIds: string[]) => {
+    const allSelected = allSignalIds.length > 0 && allSignalIds.every((id) => selectedSet.has(id));
+    const matchesAllSignals =
+      allSignalIds.length > 0 && presetIds.length === allSignalIds.length && presetIds.every((id) => allSignalIds.includes(id));
+
+    if (matchesAllSignals && allSelected) {
+      const fallback = allSignalIds.includes("1240") ? "1240" : allSignalIds[0];
+      if (fallback) {
+        onApplySignalPreset([fallback]);
+      }
+      return;
+    }
+
+    onApplySignalPreset(presetIds);
+  };
 
   return (
     <main className="workspace ranking-workspace">
@@ -3313,7 +4168,7 @@ function ChangeDetectionView({
             <h2>Change detection</h2>
           </div>
           <p className="section-copy">
-            For the selected MOE, each intersection is compared only against its own historical mean for the selected interval.
+            Blue markers are near history, yellow markers show moderate changes, and orange markers flag major changes in the selected MOE.
           </p>
         </div>
 
@@ -3360,13 +4215,14 @@ function ChangeDetectionView({
           <aside className="corridor-list">
             <p className="section-kicker">Intersections</p>
             <p className="list-note">{selectedSignalIds.length} selected for monitoring.</p>
+            <p className="list-note list-note--helper">Click the map or the list to select or deselect intersections.</p>
             <div className="preset-row">
-              {(data?.meta.selectionPresets ?? []).map((preset) => (
+              {visiblePresets.map((preset) => (
                 <button
                   key={preset.id}
                   type="button"
                   className="preset-chip"
-                  onClick={() => onApplySignalPreset(preset.intersectionIds)}
+                  onClick={() => applySelectionPreset(preset.intersectionIds)}
                 >
                   {preset.label}
                 </button>
@@ -3394,158 +4250,152 @@ function ChangeDetectionView({
       </section>
 
       <section className="filters-panel">
-        <div className="filters-grid filters-grid-v1">
-          <label>
-            <span>Selected date</span>
-            <CustomSelect
-              value={selectedDate}
-              options={(data?.availableDates ?? []).map((value) => ({ value, label: value }))}
-              onChange={onSelectedDateChange}
-              panelClassName="custom-select-panel--hours"
-            />
-          </label>
-          {granularity === "hour" ? (
-            <label>
-              <span>Selected hour</span>
-              <CustomSelect
-                value={selectedHour}
-                options={(data?.availableHours ?? []).map((value) => ({ value, label: value }))}
-                onChange={onSelectedHourChange}
-                panelClassName="custom-select-panel--hours"
-              />
-            </label>
-          ) : (
-            <div className="filter-summary">
-              <p className="filter-summary-label">Selected weekday</p>
-              <p>{data?.slotSelection.dayName ?? "—"}</p>
-              <strong>Daily comparison</strong>
+        <div className="change-detection-filters">
+          <div className="change-detection-filters__left">
+            <div className="filters-grid filters-grid-v1">
+              <label>
+                <span>Selected date</span>
+                <CustomSelect
+                  value={selectedDate}
+                  options={(data?.availableDates ?? []).map((value) => ({ value, label: value }))}
+                  onChange={onSelectedDateChange}
+                  panelClassName="custom-select-panel--hours"
+                />
+              </label>
+              {granularity === "hour" ? (
+                <label>
+                  <span>Selected hour</span>
+                  <CustomSelect
+                    value={selectedHour}
+                    options={(data?.availableHours ?? []).map((value) => ({ value, label: value }))}
+                    onChange={onSelectedHourChange}
+                    panelClassName="custom-select-panel--hours"
+                  />
+                </label>
+              ) : (
+                <div className="filter-summary">
+                  <p className="filter-summary-label">Selected weekday</p>
+                  <p>{data?.slotSelection.dayName ?? "—"}</p>
+                  <strong>Daily comparison</strong>
+                </div>
+              )}
+              <div className="filter-summary">
+                <p className="filter-summary-label">Selected slot</p>
+                <p>
+                  {granularity === "day"
+                    ? `${data?.slotSelection.dayName ?? "—"}`
+                    : `${selectedHour}`}
+                </p>
+                <strong>
+                  {granularity === "day"
+                    ? selectedDate
+                    : `${data?.summary.slotPointCount ?? 0} matching rows across dates`}
+                </strong>
+              </div>
             </div>
-          )}
-          <div className="filter-summary">
-            <p className="filter-summary-label">Selected slot</p>
-            <p>
-              {granularity === "day"
-                ? `${data?.slotSelection.dayName ?? "—"}`
-                : `${selectedHour}`}
-            </p>
-            <strong>
-              {granularity === "day"
-                ? selectedDate
-                : `${data?.summary.slotPointCount ?? 0} matching rows across dates`}
-            </strong>
           </div>
-        </div>
-
-        <div className="days-row">
-          <p className="filter-summary-label">Granularity</p>
-          <div className="day-chip-row">
-            {(data?.meta.granularityOptions ?? []).map((option) => {
-              const active = granularity === option.key;
-              return (
-                <button
-                  key={option.key}
-                  type="button"
-                  className={`day-chip bottleneck-moe-chip ${active ? "active" : ""}`}
-                  onClick={() => onGranularityChange(option.key)}
-                >
-                  {option.label}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div className="days-row">
-          <p className="filter-summary-label">MOE</p>
-          <div className="day-chip-row">
-            {(data?.meta.moeOptions ?? []).map((option) => {
-              const active = selectedMoe === option.key;
-              return (
-                <button
-                  key={option.key}
-                  type="button"
-                  className={`day-chip bottleneck-moe-chip ${active ? "active" : ""}`}
-                  onClick={() => onMoeChange(option.key)}
-                >
-                  {option.label}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="historical-summary-grid bottleneck-summary-grid">
-          <article className="history-stat">
-            <span>Signals</span>
-            <strong>{data?.summary.selectedSignalCount ?? 0}</strong>
-          </article>
-          <article className="history-stat">
-            <span>Points checked</span>
-            <strong>{data?.summary.pointCount ?? 0}</strong>
-          </article>
-          <article className="history-stat">
-            <span>Changed ±5%</span>
-            <strong>{data?.summary.changeCount ?? 0}</strong>
-          </article>
-          <article className="history-stat">
-            <span>Within threshold</span>
-            <strong>{data?.summary.stableCount ?? 0}</strong>
-          </article>
-          <article className="history-stat">
-            <span>Baseline pending</span>
-            <strong>{data?.summary.pendingCount ?? 0}</strong>
-          </article>
-          <article className="history-stat">
-            <span>Slot changes</span>
-            <strong>{data?.summary.slotChangeCount ?? 0}</strong>
-          </article>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="section-header">
-          <div>
-            <p className="section-kicker">Changes</p>
-            <h2>Flagged detections</h2>
-          </div>
-          <p className="section-copy">
-            These are the strongest percent changes for the selected interval.
-          </p>
-        </div>
-        <div className="insight-grid">
-          {topChanges.map((row) => (
-            <article key={`${row.signalId}-${row.label}`} className="insight-card">
-              <div className="insight-top">
-                <div className="insight-heading">
-                  <span className="insight-label">{row.signalId}</span>
-                </div>
-                <strong className="insight-value">{row.label}</strong>
-              </div>
-              <p className="bottleneck-cluster-tag">{row.signalName}</p>
-              <p className="bottleneck-cluster-summary">
-                {selectedMoeLabel}: {row.value?.toFixed(2) ?? "—"} vs historical mean {row.historicalMean?.toFixed(2) ?? "—"}
-              </p>
+          <div className="change-detection-filters__middle">
+            <div className="days-row">
+              <p className="filter-summary-label">Granularity</p>
               <div className="day-chip-row">
-                <span className="day-chip bottleneck-summary-chip active">
-                  {row.direction === "above" ? "Higher than history" : row.direction === "below" ? "Lower than history" : "Near history"}
-                </span>
-                <span className="day-chip bottleneck-summary-chip active">History {row.historyCount}</span>
-                <span className="day-chip bottleneck-summary-chip active">Delta {row.deltaPct?.toFixed(1) ?? "—"}%</span>
+                {(data?.meta.granularityOptions ?? []).map((option) => {
+                  const active = granularity === option.key;
+                  return (
+                    <button
+                      key={option.key}
+                      type="button"
+                      className={`day-chip bottleneck-moe-chip ${active ? "active" : ""}`}
+                      onClick={() => onGranularityChange(option.key)}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
               </div>
-            </article>
-          ))}
-          {topChanges.length ? null : (
-            <article className="insight-card">
-              <div className="insight-top">
-                <div className="insight-heading">
-                  <span className="insight-label">No changes flagged</span>
+            </div>
+          </div>
+          <div className="change-detection-filters__right">
+            <div className="days-row">
+              <p className="filter-summary-label">MOE</p>
+              <div className="day-chip-row">
+                {(data?.meta.moeOptions ?? []).map((option) => {
+                  const active = selectedMoe === option.key;
+                  return (
+                    <button
+                      key={option.key}
+                      type="button"
+                      className={`day-chip bottleneck-moe-chip ${active ? "active" : ""}`}
+                      onClick={() => onMoeChange(option.key)}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="change-detection-band">
+        <div className="change-detection-band__left">
+          <ChangeDistributionPanel
+            distribution={data?.distribution}
+            selectedMoeLabel={selectedMoeLabel}
+          />
+        </div>
+
+        <div className="change-detection-band__right">
+          <section className="panel">
+            <div className="section-header">
+              <div>
+                <p className="section-kicker">Changes</p>
+                <h2>Flagged detections</h2>
+              </div>
+              <p className="section-copy">
+                These are the strongest percent changes for the selected interval.
+              </p>
+            </div>
+            {topChanges.length ? (
+              <div className="flagged-detection-table">
+                <div className="flagged-detection-table__head">
+                  <span>Signal</span>
+                  <span>Intersection</span>
+                  <span>Period</span>
+                  <span>{selectedMoeLabel}</span>
+                  <span>Historical mean</span>
+                  <span>Delta</span>
+                  <span>Status</span>
                 </div>
+                {topChanges.map((row) => (
+                  <div
+                    key={`${row.signalId}-${row.label}`}
+                    className="flagged-detection-row"
+                    style={changeIntensityStyle(row.deltaPct)}
+                  >
+                    <strong>{row.signalId}</strong>
+                    <span>{row.signalName}</span>
+                    <span>{row.label}</span>
+                    <span>{row.value?.toFixed(2) ?? "—"}</span>
+                    <span>{row.historicalMean?.toFixed(2) ?? "—"}</span>
+                    <strong>{row.deltaPct?.toFixed(1) ?? "—"}%</strong>
+                    <span className={`change-status change-status--${row.tone === "alert" ? "change" : row.historicalMean === null ? "pending" : "stable"}`}>
+                      {row.status}
+                    </span>
+                  </div>
+                ))}
               </div>
-              <p>The selected interval is staying close to the historical mean for the current intersection selection and MOE.</p>
-            </article>
-          )}
+            ) : (
+              <article className="insight-card">
+                <div className="insight-top">
+                  <div className="insight-heading">
+                    <span className="insight-label">No changes flagged</span>
+                  </div>
+                </div>
+                <p>The selected interval is staying close to the historical mean for the current intersection selection and MOE.</p>
+              </article>
+            )}
+          </section>
         </div>
       </section>
 
@@ -3598,6 +4448,752 @@ function ChangeDetectionView({
   );
 }
 
+function ChangeDistributionPanel({
+  distribution,
+  selectedMoeLabel,
+}: {
+  distribution: ChangeDetectionResponse["distribution"] | undefined;
+  selectedMoeLabel: string;
+}) {
+  const historyValues = distribution?.historyValues ?? [];
+  const hasDistribution = historyValues.length > 0;
+  const currentMean = distribution?.currentMean;
+  const historicalMean = distribution?.historicalMean;
+  const q1 = distribution?.q1;
+  const q3 = distribution?.q3;
+  const markerY = ["Historical distribution"];
+  const densityCurve = useMemo(() => buildDensityCurve(historyValues), [historyValues]);
+  const referenceAnnotations = [
+    { label: "min", value: distribution?.historyMin },
+    { label: "lower fence", value: distribution?.lowerFence },
+    { label: "Q1", value: distribution?.q1 },
+    { label: "median", value: distribution?.median ?? distribution?.historicalMean },
+    { label: "Q3", value: distribution?.q3 },
+    { label: "upper fence", value: distribution?.upperFence },
+    { label: "max", value: distribution?.historyMax },
+  ].filter((item): item is { label: string; value: number } => item.value != null && Number.isFinite(item.value));
+
+  return (
+    <section className="panel change-distribution-panel">
+      <div className="section-header">
+        <div>
+          <p className="section-kicker">Distribution</p>
+          <h2>Change in {selectedMoeLabel}</h2>
+        </div>
+      </div>
+
+      {hasDistribution ? (
+        <>
+          <div className="chart-wrap change-distribution-chart">
+            <Plot
+              data={[
+                {
+                  type: "box",
+                  x: historyValues,
+                  y: historyValues.map(() => markerY[0]),
+                  orientation: "h",
+                  name: "Historical",
+                  marker: { color: "#5f72ff" },
+                  line: { color: "#5f72ff", width: 2 },
+                  fillcolor: "rgba(95, 114, 255, 0.28)",
+                  boxpoints: "outliers",
+                  xaxis: "x",
+                  yaxis: "y",
+                  hovertemplate: `${selectedMoeLabel}: %{x:.2f}<extra>Historical</extra>`,
+                },
+                ...(currentMean == null
+                  ? []
+                  : [
+                      {
+                        type: "scatter",
+                        mode: "markers",
+                        x: [currentMean],
+                        y: markerY,
+                        name: "Present",
+                        marker: {
+                          color: "#f4c542",
+                          line: { color: "#3677c2", width: 2 },
+                          size: 18,
+                          symbol: "star",
+                        },
+                        xaxis: "x",
+                        yaxis: "y",
+                        hovertemplate: `Present ${selectedMoeLabel}: %{x:.2f}<extra></extra>`,
+                      },
+                    ]),
+                {
+                  type: "histogram",
+                  x: historyValues,
+                  name: "Historical density",
+                  marker: { color: "rgba(84, 119, 232, 0.72)", line: { color: "#4d6ed7", width: 1 } },
+                  opacity: 0.9,
+                  histnorm: "probability density",
+                  nbinsx: distribution?.bins.length || 12,
+                  xaxis: "x2",
+                  yaxis: "y2",
+                  hovertemplate: `Bucket %{x}<br>Density %{y:.3f}<extra></extra>`,
+                },
+                {
+                  type: "scatter",
+                  mode: "lines",
+                  x: densityCurve.map((point) => point.x),
+                  y: densityCurve.map((point) => point.y),
+                  name: "Normalized density",
+                  line: { color: "#1f77b4", width: 3, shape: "spline" },
+                  xaxis: "x2",
+                  yaxis: "y2",
+                  hovertemplate: `${selectedMoeLabel}: %{x:.2f}<br>Density %{y:.3f}<extra>Normalized density</extra>`,
+                },
+                {
+                  type: "scatter",
+                  mode: "markers",
+                  x: referenceAnnotations.map((item) => item.value),
+                  y: referenceAnnotations.map(() => 0.03),
+                  name: "Historical reference points",
+                  xaxis: "x2",
+                  yaxis: "y2",
+                  marker: {
+                    size: 12,
+                    opacity: 0,
+                    color: "#5f72ff",
+                  },
+                  hovertemplate: "%{text}<extra></extra>",
+                  text: referenceAnnotations.map((item) => `${item.label}: ${item.value.toFixed(2)}`),
+                },
+              ]}
+              layout={{
+                autosize: true,
+                height: 470,
+                margin: { l: 70, r: 48, t: 54, b: 82 },
+                paper_bgcolor: "rgba(0,0,0,0)",
+                plot_bgcolor: "#e8eef6",
+                showlegend: false,
+                bargap: 0.04,
+                xaxis: {
+                  domain: [0.02, 0.98],
+                  anchor: "y",
+                  showticklabels: false,
+                  gridcolor: "rgba(255,255,255,0.9)",
+                  zeroline: false,
+                  range: distribution?.min != null && distribution?.max != null ? [distribution.min, distribution.max] : undefined,
+                },
+                yaxis: {
+                  domain: [0.76, 0.95],
+                  anchor: "x",
+                  showgrid: false,
+                  showticklabels: false,
+                },
+                xaxis2: {
+                  domain: [0.02, 0.98],
+                  anchor: "y2",
+                  matches: "x",
+                  title: { text: selectedMoeLabel },
+                  gridcolor: "rgba(255,255,255,0.9)",
+                  zeroline: false,
+                },
+                yaxis2: {
+                  domain: [0.12, 0.68],
+                  anchor: "x2",
+                  title: { text: "Probability density" },
+                  gridcolor: "rgba(255,255,255,0.9)",
+                  zeroline: false,
+                },
+                shapes: [
+                  ...(q1 == null ? [] : [{ type: "line", x0: q1, x1: q1, y0: 0, y1: 1, xref: "x2", yref: "paper", line: { color: "#68a77e", dash: "dash", width: 1.5 } }]),
+                  ...(historicalMean == null ? [] : [{ type: "line", x0: historicalMean, x1: historicalMean, y0: 0, y1: 1, xref: "x2", yref: "paper", line: { color: "#d56b5b", dash: "dot", width: 1.5 } }]),
+                  ...(q3 == null ? [] : [{ type: "line", x0: q3, x1: q3, y0: 0, y1: 1, xref: "x2", yref: "paper", line: { color: "#68a77e", dash: "dash", width: 1.5 } }]),
+                  ...(currentMean == null ? [] : [{ type: "line", x0: currentMean, x1: currentMean, y0: 0, y1: 1, xref: "x2", yref: "paper", line: { color: "#7c3fb0", width: 2 } }]),
+                ],
+                annotations: currentMean == null ? [] : [{ x: currentMean, y: 0.99, xref: "x", yref: "paper", text: "Present value", showarrow: true, arrowhead: 3, ax: -36, ay: -28, font: { color: "#4b2c72" }, arrowcolor: "#7c3fb0" }],
+              }}
+              config={{ responsive: true, displayModeBar: true }}
+              style={{ width: "100%", height: "470px" }}
+            />
+          </div>
+
+          <div className="distribution-note-grid">
+            <article>
+              <span>Historical samples</span>
+              <strong>{distribution?.historyCount ?? 0}</strong>
+            </article>
+            <article>
+              <span>Present samples</span>
+              <strong>{distribution?.currentCount ?? 0}</strong>
+            </article>
+            <article>
+              <span>Historical mean</span>
+              <strong>{distribution?.historicalMean?.toFixed(2) ?? "—"}</strong>
+            </article>
+            <article>
+              <span>Present mean</span>
+              <strong>{distribution?.currentMean?.toFixed(2) ?? "—"}</strong>
+            </article>
+          </div>
+        </>
+      ) : (
+        <div className="status-banner">No historical distribution is available for the selected MOE and interval.</div>
+      )}
+    </section>
+  );
+}
+
+function GroupingPreviewView({
+  intersections,
+  availableDates,
+  maxAvailableDate,
+  availableDays,
+  dateFrom,
+  dateTo,
+  onDateFromChange,
+  onDateToChange,
+  daysOfWeek,
+  onDaysOfWeekChange,
+  hourFrom,
+  hourTo,
+  onHourFromChange,
+  onHourToChange,
+  moe,
+  onMoeChange,
+  threshold,
+  onThresholdChange,
+}: {
+  intersections: IntersectionPayload[];
+  availableDates: string[];
+  maxAvailableDate?: string;
+  availableDays: string[];
+  hourOptions: string[];
+  dateFrom: string;
+  dateTo: string;
+  onDateFromChange: (value: string) => void;
+  onDateToChange: (value: string) => void;
+  daysOfWeek: string[];
+  onDaysOfWeekChange: Dispatch<SetStateAction<string[]>>;
+  hourFrom: string;
+  hourTo: string;
+  onHourFromChange: (value: string) => void;
+  onHourToChange: (value: string) => void;
+  moe: Exclude<RankingMetricKey, "compositeScore">;
+  onMoeChange: (value: Exclude<RankingMetricKey, "compositeScore">) => void;
+  threshold: string;
+  onThresholdChange: (value: string) => void;
+}) {
+  const orderedIntersections = useMemo(
+    () => [...intersections].sort((left, right) => left.lon - right.lon),
+    [intersections]
+  );
+
+  const lookup = useMemo(
+    () => new Map(orderedIntersections.map((intersection) => [intersection.id, intersection])),
+    [orderedIntersections]
+  );
+  const [grouping, setGrouping] = useState<GroupingPreviewResponse | null>(null);
+  const [loadingGrouping, setLoadingGrouping] = useState(false);
+  const [groupingError, setGroupingError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function loadGrouping() {
+      if (!orderedIntersections.length) {
+        setGrouping(null);
+        setLoadingGrouping(false);
+        return;
+      }
+      const startedAt = performance.now();
+      setLoadingGrouping(true);
+      setGroupingError(null);
+      try {
+        const params = new URLSearchParams({
+          intersectionIds: orderedIntersections.map((intersection) => intersection.id).join(","),
+          dateFrom,
+          dateTo,
+          daysOfWeek: daysOfWeek.join(","),
+          hourFrom,
+          hourTo,
+          moe,
+          threshold,
+        });
+        const response = await fetch(apiUrl("/api/grouping-preview", params), { signal: controller.signal });
+        if (!response.ok) {
+          throw new Error(`Backend request failed with status ${response.status}`);
+        }
+        const payload: GroupingPreviewResponse = await response.json();
+        setGrouping(payload);
+      } catch (error) {
+        if ((error as Error).name !== "AbortError") {
+          setGroupingError(error instanceof Error ? error.message : "Failed to load grouping preview");
+          setGrouping(null);
+        }
+      } finally {
+        const elapsedMs = performance.now() - startedAt;
+        if (elapsedMs < 650) {
+          await new Promise((resolve) => window.setTimeout(resolve, 650 - elapsedMs));
+        }
+        if (!controller.signal.aborted) {
+          setLoadingGrouping(false);
+        }
+      }
+    }
+
+    loadGrouping();
+    return () => controller.abort();
+  }, [orderedIntersections, dateFrom, dateTo, daysOfWeek, hourFrom, hourTo, moe, threshold]);
+
+  const groups = useMemo(
+    () => {
+      const rawGroups = Object.values(grouping?.results ?? {}).flatMap((directionResult) =>
+        (directionResult.groups ?? []).map((group, index) => ({
+          label: `${directionResult.direction === "LR" ? "Eastbound" : "Westbound"} Group ${index + 1}`,
+          ids: group.members,
+          summary: `${directionResult.direction === "LR" ? "LR / eastbound" : "RL / westbound"} · rho ${group.mean_internal_rho.toFixed(2)} · ${group.size} intersections`,
+          direction: directionResult.direction,
+          directionLabel: directionResult.direction === "LR" ? "LR / eastbound" : "RL / westbound",
+        }))
+      );
+      return rawGroups.map((group, index) => ({
+        ...group,
+        color: GROUPING_PALETTE[index % GROUPING_PALETTE.length],
+      }));
+    },
+    [grouping]
+  );
+  const westToEastGroups = useMemo(() => groups.filter((group) => group.direction === "LR"), [groups]);
+  const eastToWestGroups = useMemo(() => groups.filter((group) => group.direction === "RL"), [groups]);
+  const westToEastMarkerColors = useMemo(() => {
+    const colors = new Map<string, string[]>();
+    westToEastGroups.forEach((group) => {
+      group.ids.forEach((id) => {
+        colors.set(id, [...(colors.get(id) ?? []), group.color]);
+      });
+    });
+    return colors;
+  }, [westToEastGroups]);
+  const eastToWestMarkerColors = useMemo(() => {
+    const colors = new Map<string, string[]>();
+    eastToWestGroups.forEach((group) => {
+      group.ids.forEach((id) => {
+        colors.set(id, [...(colors.get(id) ?? []), group.color]);
+      });
+    });
+    return colors;
+  }, [eastToWestGroups]);
+  const clusterSummaries = Object.values(grouping?.results ?? {}).flatMap((directionResult) =>
+    (directionResult.groups ?? []).map((group, index) => ({
+      id: group.group_id,
+      label: `${directionResult.direction === "LR" ? "Eastbound" : "Westbound"} Group ${index + 1}`,
+      direction: directionResult.direction,
+      members: group.member_labels,
+      memberDetails:
+        group.member_details ??
+        group.members.map((memberId, memberIndex) => ({
+          id: memberId,
+          label: group.member_labels[memberIndex] ?? memberId,
+          avg_moe: null,
+        })),
+      size: group.size,
+      span: group.corridor_order_span,
+      rho: group.mean_internal_rho,
+    }))
+  );
+  const groupingLoading = loadingGrouping;
+  const supportedGroupingMoes = [
+    "aogPct",
+    "aorPct",
+    "avgWait",
+    "greenOccupancyPct",
+    "redOccupancyPct",
+    "splitFailures",
+    "maxOuts",
+    "forceOffs",
+  ] as const;
+  const groupingMoeLabels: Record<(typeof supportedGroupingMoes)[number], string> = {
+    aogPct: "AOG %",
+    aorPct: "AOR %",
+    avgWait: "Avg Wait",
+    greenOccupancyPct: "Green Occ %",
+    redOccupancyPct: "Red Occ %",
+    splitFailures: "Split Failures",
+    maxOuts: "Max-Outs",
+    forceOffs: "Force-Offs",
+  };
+
+  const mapCenter = useMemo<LatLngExpression>(() => {
+    if (!orderedIntersections.length) {
+      return [27.2989, -82.48];
+    }
+    const lat = orderedIntersections.reduce((sum, intersection) => sum + intersection.lat, 0) / orderedIntersections.length;
+    const lon = orderedIntersections.reduce((sum, intersection) => sum + intersection.lon, 0) / orderedIntersections.length;
+    return [lat, lon];
+  }, [orderedIntersections]);
+
+  return (
+    <main className="workspace ranking-workspace">
+      <section className="filters-panel">
+        <div className="change-detection-filters">
+          <div className="change-detection-filters__left">
+            <div className="filters-grid filters-grid-v1">
+              <label>
+                <span>Date from</span>
+                <input
+                  type="date"
+                  value={dateFrom}
+                  min={availableDates[0]}
+                  max={maxAvailableDate}
+                  onChange={(event) => onDateFromChange(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>Date to</span>
+                <input
+                  type="date"
+                  value={dateTo}
+                  min={availableDates[0]}
+                  max={maxAvailableDate}
+                  onChange={(event) => onDateToChange(event.target.value)}
+                />
+              </label>
+              <div className="filter-summary">
+                <p className="filter-summary-label">Selected slot</p>
+                <p>{`${hourFrom} to ${hourTo}`}</p>
+                <strong>{moe === "avgWait" ? "Average wait" : moe}</strong>
+              </div>
+              <label>
+                <span>Correlation threshold</span>
+                <input
+                  type="number"
+                  min="0.05"
+                  max="0.99"
+                  step="0.01"
+                  value={threshold}
+                  onChange={(event) => onThresholdChange(event.target.value)}
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="change-detection-filters__middle">
+            <div className="days-row">
+              <p className="filter-summary-label">Hours of Day</p>
+              <div className="hour-range-grid">
+                <label>
+                  <span>Hour from</span>
+                  <CustomSelect
+                    value={hourFrom}
+                    options={hourOptions.map((value) => ({ value, label: value }))}
+                    onChange={onHourFromChange}
+                    panelClassName="custom-select-panel--hours"
+                  />
+                </label>
+                <label>
+                  <span>Hour to</span>
+                  <CustomSelect
+                    value={hourTo}
+                    options={hourOptions.map((value) => ({ value, label: value }))}
+                    onChange={onHourToChange}
+                    panelClassName="custom-select-panel--hours"
+                  />
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div className="change-detection-filters__right">
+            <div className="days-row">
+              <p className="filter-summary-label">MOE</p>
+              <div className="day-chip-row">
+                {supportedGroupingMoes.map((option) => {
+                  const active = moe === option;
+                  return (
+                    <button
+                      key={option}
+                      type="button"
+                      className={`day-chip bottleneck-moe-chip ${active ? "active" : ""}`}
+                      onClick={() => onMoeChange(option)}
+                    >
+                      {groupingMoeLabels[option]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="days-row grouping-days-row">
+          <p className="filter-summary-label">Days of Week</p>
+          <div className="day-chip-row">
+            {availableDays.map((day) => {
+              const active = daysOfWeek.includes(day);
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  className={`day-chip ${active ? "active" : ""}`}
+                  onClick={() =>
+                    onDaysOfWeekChange((current) =>
+                      active ? current.filter((item) => item !== day) : [...current, day]
+                    )
+                  }
+                >
+                  {day.slice(0, 2)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="section-header">
+          <div>
+            <p className="section-kicker">Grouping</p>
+            <h2>Grouping boxes for consecutive intersections</h2>
+            <p className="section-copy">
+              {loadingGrouping
+                ? "Loading grouping output from the backend..."
+                : groupingError
+                  ? groupingError
+                  : grouping?.note ?? "The boxes below are drawn from the algorithm result for the current filter window."}
+            </p>
+          </div>
+          {loadingGrouping ? <div className="grouping-loading-pill">Calculating groups...</div> : null}
+        </div>
+
+        <div className="grouping-map-shell">
+          <div className="grouping-map-grid">
+            <article className="grouping-map-panel">
+              <div className="grouping-map-panel__header">
+                <span>West-to-east</span>
+                <strong>LR / Eastbound</strong>
+              </div>
+              <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} className="leaflet-map grouping-map">
+                <TileLayer
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+                {orderedIntersections.map((intersection) => (
+                  <Marker
+                    key={intersection.id}
+                    position={[intersection.lat, intersection.lon]}
+                    icon={buildGroupingMarkerIcon(westToEastMarkerColors.get(intersection.id) ?? [])}
+                  >
+                    <Popup>
+                      <strong>{intersection.name}</strong>
+                      <br />
+                      Signal ID {intersection.id}
+                    </Popup>
+                  </Marker>
+                ))}
+                <GroupingBoxesOverlay groups={westToEastGroups} intersections={lookup} />
+              </MapContainer>
+            </article>
+
+            <article className="grouping-map-panel">
+              <div className="grouping-map-panel__header">
+                <span>East-to-west</span>
+                <strong>RL / Westbound</strong>
+              </div>
+              <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} className="leaflet-map grouping-map">
+                <TileLayer
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+                {orderedIntersections.map((intersection) => (
+                  <Marker
+                    key={intersection.id}
+                    position={[intersection.lat, intersection.lon]}
+                    icon={buildGroupingMarkerIcon(eastToWestMarkerColors.get(intersection.id) ?? [])}
+                  >
+                    <Popup>
+                      <strong>{intersection.name}</strong>
+                      <br />
+                      Signal ID {intersection.id}
+                    </Popup>
+                  </Marker>
+                ))}
+                <GroupingBoxesOverlay groups={eastToWestGroups} intersections={lookup} />
+              </MapContainer>
+            </article>
+          </div>
+          {groupingLoading ? (
+            <div className="grouping-loading-overlay" aria-live="polite">
+              <div className="grouping-loading-card">
+                <span className="grouping-loading-spinner" aria-hidden="true" />
+                <div>
+                  <strong>Calculating groups</strong>
+                  <span>Running the grouping algorithm for the selected filters.</span>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="grouping-cluster-list">
+          <p className="filter-summary-label">Clusters found</p>
+          {groupingLoading ? <p className="list-note">Loading clusters...</p> : null}
+          {!groupingLoading && grouping && clusterSummaries.length === 0 ? (
+            <p className="list-note">
+              No contiguous groups met the current threshold. Lower the threshold to surface looser groupings.
+            </p>
+          ) : null}
+          {clusterSummaries.length > 0 ? (
+            <article className="grouping-cluster-card">
+              <div className="grouping-cluster-card__top">
+                <strong>Clusters formed</strong>
+                <span>{clusterSummaries.length} clusters</span>
+              </div>
+              <div className="grouping-cluster-table">
+                <div className="grouping-cluster-table__head">
+                  <span>Cluster</span>
+                  <span>Direction</span>
+                  <span>Intersections and Avg MOE</span>
+                  <span>Mean rho</span>
+                  <span>Span</span>
+                </div>
+                {clusterSummaries.map((group) => (
+                  <div key={group.id} className="grouping-cluster-row">
+                    <strong>{group.label}</strong>
+                    <span>{group.direction === "LR" ? "Eastbound" : "Westbound"}</span>
+                    <span className="grouping-member-list">
+                      {group.memberDetails.map((member) => (
+                        <span key={member.id} className="grouping-member-item">
+                          <strong>{member.label}</strong>
+                          <span>
+                            Avg {groupingMoeLabels[moe]}:{" "}
+                            {typeof member.avg_moe === "number" ? member.avg_moe.toFixed(2) : "N/A"}
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                    <span>{group.rho.toFixed(2)}</span>
+                    <span>{group.span.join(" to ")}</span>
+                  </div>
+                ))}
+              </div>
+            </article>
+          ) : null}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function GroupingBoxesOverlay({
+  groups,
+  intersections,
+}: {
+  groups: Array<{ label: string; ids: string[]; summary?: string; directionLabel?: string; direction: string; color: string }>;
+  intersections: Map<string, IntersectionPayload>;
+}) {
+  const map = useMap();
+  const [banners, setBanners] = useState<
+    Array<{
+      points: string;
+      color: string;
+      directionLabel?: string;
+      labelX: number;
+      labelY: number;
+    }>
+  >([]);
+
+  useEffect(() => {
+    const updateBanners = () => {
+      const allIntersections = Array.from(intersections.values());
+      const orderedPoints = [...allIntersections]
+        .sort((left, right) => left.lon - right.lon)
+        .map((intersection) => map.latLngToContainerPoint([intersection.lat, intersection.lon]));
+      const corridorSpan =
+        orderedPoints.length >= 2
+          ? orderedPoints[0].distanceTo(orderedPoints[orderedPoints.length - 1])
+          : 360;
+      const widthHalf = Math.max(16, Math.min(28, corridorSpan * 0.025));
+
+      const nextBanners = groups
+        .map((group, index) => {
+          const members = group.ids
+            .map((id) => intersections.get(id))
+            .filter((intersection): intersection is IntersectionPayload => Boolean(intersection))
+            .sort((left, right) => left.lon - right.lon);
+          if (!members.length) {
+            return null;
+          }
+          const first = members[0];
+          const last = members[members.length - 1];
+          const firstPoint = map.latLngToContainerPoint([first.lat, first.lon]);
+          const lastPoint = map.latLngToContainerPoint([last.lat, last.lon]);
+          const origin = group.direction === "RL" ? lastPoint : firstPoint;
+          const dest = group.direction === "RL" ? firstPoint : lastPoint;
+          const dx = dest.x - origin.x;
+          const dy = dest.y - origin.y;
+          const span = Math.max(1, Math.hypot(dx, dy));
+          const ux = dx / span;
+          const uy = dy / span;
+          const px = -uy;
+          const py = ux;
+          const headLen = Math.min(Math.max(0.2 * span, 2.5 * widthHalf), 5 * widthHalf);
+          const padBack = 0.08 * span;
+          const padFront = 0.04 * span;
+          const notchDepth = Math.min(0.08 * span, 1.5 * widthHalf);
+          const tailCenter = { x: origin.x - ux * padBack, y: origin.y - uy * padBack };
+          const shoulderCenter = { x: dest.x + ux * padFront, y: dest.y + uy * padFront };
+          const tip = { x: shoulderCenter.x + ux * headLen, y: shoulderCenter.y + uy * headLen };
+          const notch = { x: tailCenter.x + ux * notchDepth, y: tailCenter.y + uy * notchDepth };
+          const tailTop = { x: tailCenter.x + px * widthHalf, y: tailCenter.y + py * widthHalf };
+          const tailBottom = { x: tailCenter.x - px * widthHalf, y: tailCenter.y - py * widthHalf };
+          const shoulderTop = { x: shoulderCenter.x + px * widthHalf, y: shoulderCenter.y + py * widthHalf };
+          const shoulderBottom = { x: shoulderCenter.x - px * widthHalf, y: shoulderCenter.y - py * widthHalf };
+          const ring = [tailTop, shoulderTop, tip, shoulderBottom, tailBottom, notch];
+          const labelX = (origin.x + dest.x) / 2;
+          const labelY = (origin.y + dest.y) / 2;
+          return {
+            points: ring.map((point) => `${point.x},${point.y}`).join(" "),
+            color: group.color,
+            directionLabel: group.directionLabel,
+            labelX,
+            labelY,
+          };
+        })
+        .filter((banner): banner is NonNullable<typeof banner> => Boolean(banner));
+      setBanners(nextBanners);
+    };
+
+    updateBanners();
+    map.on("move zoom resize", updateBanners);
+    return () => {
+      map.off("move zoom resize", updateBanners);
+    };
+  }, [groups, intersections, map]);
+
+  return (
+    <div className="grouping-overlay">
+      <svg className="grouping-arrow-layer">
+        {banners.map((banner) => (
+          <g key={`${banner.points}-${banner.color}`}>
+            <polygon
+              points={banner.points}
+              fill={banner.color}
+              fillOpacity="0.22"
+              stroke={banner.color}
+              strokeWidth="5"
+              strokeLinejoin="round"
+            />
+            {banner.directionLabel ? (
+              <text
+                x={banner.labelX}
+                y={banner.labelY}
+                textAnchor="middle"
+                dominantBaseline="middle"
+                className="grouping-arrow-label"
+              >
+                {banner.directionLabel}
+              </text>
+            ) : null}
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
 function insightBlock(title: string, what: string, meaning: string) {
   return (
     <div className="chart-notes">
@@ -3614,31 +5210,44 @@ function insightBlock(title: string, what: string, meaning: string) {
 export function App() {
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [historicalDashboard, setHistoricalDashboard] = useState<DashboardResponse | null>(null);
-  const [activeView, setActiveView] = useState<"dashboard" | "historicalDashboard" | "historical" | "ranking" | "dayHour" | "bottleneck" | "hdbscan" | "changeDetection">("dashboard");
+  const [activeView, setActiveView] = useState<"dashboard" | "historicalDashboard" | "historical" | "ranking" | "dayHour" | "groupingPreview" | "correlationCliques" | "bottleneckDetection" | "bottleneck" | "hdbscan" | "changeDetection">("historicalDashboard");
   const [historical, setHistorical] = useState<HistoricalRunResponse | null>(null);
   const [rankingData, setRankingData] = useState<RankingResponse | null>(null);
   const [dayHourData, setDayHourData] = useState<DayHourResponse | null>(null);
+  const [bottleneckDetectionData, setBottleneckDetectionData] = useState<BottleneckDetectionResponse | null>(null);
+  const [correlationCliquesData, setCorrelationCliquesData] = useState<CorrelationCliquesResponse | null>(null);
   const [bottleneckData, setBottleneckData] = useState<BottleneckResponse | null>(null);
   const [hdbscanData, setHdbscanData] = useState<HdbscanResponse | null>(null);
   const [changeDetectionData, setChangeDetectionData] = useState<ChangeDetectionResponse | null>(null);
   const [historicalSignalId, setHistoricalSignalId] = useState("1470");
   const [dayHourMetric, setDayHourMetric] = useState<Exclude<RankingMetricKey, "compositeScore">>("avgWait");
+  const [bottleneckDetectionMoe, setBottleneckDetectionMoe] = useState<Exclude<RankingMetricKey, "compositeScore">>("aorPct");
+  const [bottleneckDetectionThreshold, setBottleneckDetectionThreshold] = useState("60");
+  const [correlationCliquesMoe, setCorrelationCliquesMoe] = useState<CorrelationCliqueMoeKey>("volume");
+  const [correlationCliquesThreshold, setCorrelationCliquesThreshold] = useState("0.60");
   const [bottleneckSignalId, setBottleneckSignalId] = useState("1240");
   const [bottleneckPhase, setBottleneckPhase] = useState("1");
   const [bottleneckMoes, setBottleneckMoes] = useState<string[]>(["aogPct", "aorPct", "volume", "avgWait", "splitFailures"]);
   const [bottleneckEps, setBottleneckEps] = useState("0.25");
   const [bottleneckMinSamples, setBottleneckMinSamples] = useState("2");
-  const [hdbscanSignalIds, setHdbscanSignalIds] = useState<string[]>(["1240", "1242", "1244"]);
+  const [hdbscanSignalIds, setHdbscanSignalIds] = useState<string[]>([]);
   const [hdbscanPhases, setHdbscanPhases] = useState<string[]>(["1"]);
   const [hdbscanMoes, setHdbscanMoes] = useState<string[]>(["aogPct", "aorPct", "volume", "avgWait", "splitFailures"]);
   const [hdbscanMinClusterSize, setHdbscanMinClusterSize] = useState("6");
   const [hdbscanMinSamples, setHdbscanMinSamples] = useState("3");
   const [hdbscanClusterSelectionEpsilon, setHdbscanClusterSelectionEpsilon] = useState("0.05");
-  const [changeDetectionSignalIds, setChangeDetectionSignalIds] = useState<string[]>(["1240", "1242", "1244"]);
+  const [changeDetectionSignalIds, setChangeDetectionSignalIds] = useState<string[]>([]);
   const [changeDetectionMoe, setChangeDetectionMoe] = useState<Exclude<RankingMetricKey, "compositeScore">>("avgWait");
   const [changeDetectionGranularity, setChangeDetectionGranularity] = useState<"day" | "hour">("hour");
   const [changeDetectionSelectedDate, setChangeDetectionSelectedDate] = useState("2026-03-04");
   const [changeDetectionSelectedHour, setChangeDetectionSelectedHour] = useState("06:00");
+  const [groupingPreviewDateFrom, setGroupingPreviewDateFrom] = useState("2026-02-02");
+  const [groupingPreviewDateTo, setGroupingPreviewDateTo] = useState("2026-03-04");
+  const [groupingPreviewDaysOfWeek, setGroupingPreviewDaysOfWeek] = useState<string[]>(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]);
+  const [groupingPreviewHourFrom, setGroupingPreviewHourFrom] = useState("06:00");
+  const [groupingPreviewHourTo, setGroupingPreviewHourTo] = useState("18:00");
+  const [groupingPreviewMoe, setGroupingPreviewMoe] = useState<Exclude<RankingMetricKey, "compositeScore">>("avgWait");
+  const [groupingPreviewThreshold, setGroupingPreviewThreshold] = useState("0.25");
   const [filters, setFilters] = useState<FilterState>({
     dateFrom: "",
     dateTo: "",
@@ -3655,6 +5264,8 @@ export function App() {
   const [historicalLoading, setHistoricalLoading] = useState(false);
   const [rankingLoading, setRankingLoading] = useState(false);
   const [dayHourLoading, setDayHourLoading] = useState(false);
+  const [bottleneckDetectionLoading, setBottleneckDetectionLoading] = useState(false);
+  const [correlationCliquesLoading, setCorrelationCliquesLoading] = useState(false);
   const [bottleneckLoading, setBottleneckLoading] = useState(false);
   const [hdbscanLoading, setHdbscanLoading] = useState(false);
   const [changeDetectionLoading, setChangeDetectionLoading] = useState(false);
@@ -3663,6 +5274,8 @@ export function App() {
   const [historicalError, setHistoricalError] = useState<string | null>(null);
   const [rankingError, setRankingError] = useState<string | null>(null);
   const [dayHourError, setDayHourError] = useState<string | null>(null);
+  const [bottleneckDetectionError, setBottleneckDetectionError] = useState<string | null>(null);
+  const [correlationCliquesError, setCorrelationCliquesError] = useState<string | null>(null);
   const [bottleneckError, setBottleneckError] = useState<string | null>(null);
   const [hdbscanError, setHdbscanError] = useState<string | null>(null);
   const [changeDetectionError, setChangeDetectionError] = useState<string | null>(null);
@@ -3692,6 +5305,9 @@ export function App() {
     });
 
   useEffect(() => {
+    if (activeView !== "dashboard") {
+      return;
+    }
     const controller = new AbortController();
 
     async function loadDashboard() {
@@ -3700,7 +5316,7 @@ export function App() {
       const params = buildDashboardParams();
 
       try {
-        const response = await fetch(`${API_BASE_URL}/api/dashboard?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/dashboard", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3730,6 +5346,7 @@ export function App() {
     loadDashboard();
     return () => controller.abort();
   }, [
+    activeView,
     filters.dateFrom,
     filters.dateTo,
     filters.daysOfWeek.join(","),
@@ -3752,7 +5369,7 @@ export function App() {
       const params = buildHistoricalDashboardParams();
 
       try {
-        const response = await fetch(`${API_BASE_URL}/api/historical-dashboard?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/historical-dashboard", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3760,6 +5377,15 @@ export function App() {
         }
         const nextDashboard: DashboardResponse = await response.json();
         setHistoricalDashboard(nextDashboard);
+        setFilters({
+          dateFrom: nextDashboard.filters.dateFrom,
+          dateTo: nextDashboard.filters.dateTo,
+          daysOfWeek: nextDashboard.filters.daysOfWeek,
+          hourFrom: nextDashboard.filters.hourFrom,
+          hourTo: nextDashboard.filters.hourTo,
+          timeOfDayPreset: nextDashboard.filters.timeOfDayPreset,
+          selectedPhase: nextDashboard.filters.selectedPhase
+        });
         setHistoricalDashboardIntersectionIds(nextDashboard.filters.selectedIntersectionIds);
       } catch (requestError) {
         if ((requestError as Error).name !== "AbortError") {
@@ -3802,7 +5428,7 @@ export function App() {
           hourTo: filters.hourTo,
           timeOfDayPreset: filters.timeOfDayPreset
         });
-        const response = await fetch(`${API_BASE_URL}/api/ranking?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/ranking", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3843,7 +5469,7 @@ export function App() {
       setHistoricalError(null);
       try {
         const params = new URLSearchParams({ signalId: historicalSignalId });
-        const response = await fetch(`${API_BASE_URL}/api/historical-run?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/historical-run", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3887,7 +5513,7 @@ export function App() {
           hourTo: filters.hourTo,
           timeOfDayPreset: filters.timeOfDayPreset
         });
-        const response = await fetch(`${API_BASE_URL}/api/day-hour?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/day-hour", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -3919,6 +5545,106 @@ export function App() {
   ]);
 
   useEffect(() => {
+    if (activeView !== "bottleneckDetection") {
+      return;
+    }
+    const controller = new AbortController();
+
+    async function loadBottleneckDetectionView() {
+      setBottleneckDetectionLoading(true);
+      setBottleneckDetectionError(null);
+      try {
+        const params = new URLSearchParams({
+          dateFrom: filters.dateFrom,
+          dateTo: filters.dateTo,
+          daysOfWeek: filters.daysOfWeek.join(","),
+          hourFrom: filters.hourFrom,
+          hourTo: filters.hourTo,
+          moe: bottleneckDetectionMoe,
+          threshold: bottleneckDetectionThreshold,
+        });
+        const response = await fetch(apiUrl("/api/bottleneck-detection", params), {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Backend request failed with status ${response.status}`);
+        }
+        const nextData: BottleneckDetectionResponse = await response.json();
+        setBottleneckDetectionData(nextData);
+      } catch (requestError) {
+        if ((requestError as Error).name !== "AbortError") {
+          setBottleneckDetectionError((requestError as Error).message);
+        }
+      } finally {
+        setBottleneckDetectionLoading(false);
+      }
+    }
+
+    loadBottleneckDetectionView();
+    return () => controller.abort();
+  }, [
+    activeView,
+    filters.dateFrom,
+    filters.dateTo,
+    filters.daysOfWeek.join(","),
+    filters.hourFrom,
+    filters.hourTo,
+    bottleneckDetectionMoe,
+    bottleneckDetectionThreshold,
+  ]);
+
+  useEffect(() => {
+    if (activeView !== "correlationCliques") {
+      return;
+    }
+    const controller = new AbortController();
+
+    async function loadCorrelationCliquesView() {
+      setCorrelationCliquesLoading(true);
+      setCorrelationCliquesError(null);
+      try {
+        const params = new URLSearchParams({
+          dateFrom: filters.dateFrom,
+          dateTo: filters.dateTo,
+          daysOfWeek: filters.daysOfWeek.join(","),
+          hourFrom: filters.hourFrom,
+          hourTo: filters.hourTo,
+          moe: correlationCliquesMoe,
+          threshold: correlationCliquesThreshold,
+        });
+        const response = await fetch(apiUrl("/api/correlation-cliques", params), {
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`Backend request failed with status ${response.status}`);
+        }
+        const nextData: CorrelationCliquesResponse = await response.json();
+        setCorrelationCliquesData(nextData);
+        setCorrelationCliquesMoe(nextData.filters.moe);
+        setCorrelationCliquesThreshold(String(nextData.filters.threshold));
+      } catch (requestError) {
+        if ((requestError as Error).name !== "AbortError") {
+          setCorrelationCliquesError((requestError as Error).message);
+        }
+      } finally {
+        setCorrelationCliquesLoading(false);
+      }
+    }
+
+    loadCorrelationCliquesView();
+    return () => controller.abort();
+  }, [
+    activeView,
+    filters.dateFrom,
+    filters.dateTo,
+    filters.daysOfWeek.join(","),
+    filters.hourFrom,
+    filters.hourTo,
+    correlationCliquesMoe,
+    correlationCliquesThreshold,
+  ]);
+
+  useEffect(() => {
     if (activeView !== "bottleneck") {
       return;
     }
@@ -3935,7 +5661,7 @@ export function App() {
           eps: bottleneckEps,
           minSamples: bottleneckMinSamples,
         });
-        const response = await fetch(`${API_BASE_URL}/api/bottleneck-clusters?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/bottleneck-clusters", params), {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -3978,7 +5704,7 @@ export function App() {
           minSamples: hdbscanMinSamples,
           clusterSelectionEpsilon: hdbscanClusterSelectionEpsilon,
         });
-        const response = await fetch(`${API_BASE_URL}/api/hdbscan-clusters?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/hdbscan-clusters", params), {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -4016,6 +5742,10 @@ export function App() {
     if (activeView !== "changeDetection") {
       return;
     }
+    const fallbackSignalIds =
+      changeDetectionSignalIds.length > 0
+        ? changeDetectionSignalIds
+        : (historicalDashboard?.corridor.allIntersections ?? dashboard?.corridor.allIntersections ?? []).map((intersection) => intersection.id);
     const controller = new AbortController();
 
     async function loadChangeDetectionView() {
@@ -4024,13 +5754,13 @@ export function App() {
 
       try {
         const params = new URLSearchParams({
-          signalIds: changeDetectionSignalIds.join(","),
+          signalIds: fallbackSignalIds.join(","),
           moe: changeDetectionMoe,
           granularity: changeDetectionGranularity,
           selectedDate: changeDetectionSelectedDate,
           selectedHour: changeDetectionSelectedHour,
         });
-        const response = await fetch(`${API_BASE_URL}/api/change-detection?${params.toString()}`, {
+        const response = await fetch(apiUrl("/api/change-detection", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -4057,6 +5787,8 @@ export function App() {
   }, [
     activeView,
     changeDetectionSignalIds.join(","),
+    historicalDashboard?.corridor.allIntersections.map((intersection) => intersection.id).join(","),
+    dashboard?.corridor.allIntersections.map((intersection) => intersection.id).join(","),
     changeDetectionMoe,
     changeDetectionGranularity,
     changeDetectionSelectedDate,
@@ -4331,6 +6063,15 @@ export function App() {
   const availableDays = currentDashboard?.meta.availableDays.length ? currentDashboard.meta.availableDays : fallbackDays;
   const availableDates = currentDashboard?.meta.availableDates ?? [];
   const maxAvailableDate = availableDates.length ? availableDates[availableDates.length - 1] : undefined;
+  const groupingPreviewIntersections = currentDashboard?.corridor.allIntersections ?? historicalDashboard?.corridor.allIntersections ?? [];
+  const mainMapPoints = useMemo(
+    () =>
+      corridorOrderedIntersections.map(
+        (intersection) => [intersection.lat, intersection.lon] as LatLngExpression
+      ),
+    [corridorOrderedIntersections]
+  );
+  const mainMapCenter = mainMapPoints[0] ?? ([27.2989, -82.48] as LatLngExpression);
 
   return (
     <div className="app-shell">
@@ -4371,18 +6112,43 @@ export function App() {
         </button>
         <button
           type="button"
-          className={activeView === "bottleneck" ? "active" : ""}
-          onClick={() => setActiveView("bottleneck")}
+          className={activeView === "groupingPreview" ? "active" : ""}
+          onClick={() => setActiveView("groupingPreview")}
         >
-          Bottleneck Clusters
+          Grouping Intersections
         </button>
         <button
           type="button"
-          className={activeView === "hdbscan" ? "active" : ""}
-          onClick={() => setActiveView("hdbscan")}
+          className={activeView === "correlationCliques" ? "active" : ""}
+          onClick={() => setActiveView("correlationCliques")}
         >
-          HDBSCAN Clusters
+          Correlation Cliques
         </button>
+        <button
+          type="button"
+          className={activeView === "bottleneckDetection" ? "active" : ""}
+          onClick={() => setActiveView("bottleneckDetection")}
+        >
+          Bottleneck Detection
+        </button>
+        {SHOW_CLUSTER_TABS ? (
+          <>
+            <button
+              type="button"
+              className={activeView === "bottleneck" ? "active" : ""}
+              onClick={() => setActiveView("bottleneck")}
+            >
+              Bottleneck Clusters
+            </button>
+            <button
+              type="button"
+              className={activeView === "hdbscan" ? "active" : ""}
+              onClick={() => setActiveView("hdbscan")}
+            >
+              HDBSCAN Clusters
+            </button>
+          </>
+        ) : null}
         <button
           type="button"
           className={activeView === "changeDetection" ? "active" : ""}
@@ -4426,11 +6192,12 @@ export function App() {
 
           <div className="map-frame">
             <MapContainer
-              center={intersections[0] ? [intersections[0].lat, intersections[0].lon] : [28.54, -81.37]}
-              zoom={9}
+              center={mainMapCenter}
+              zoom={13}
               scrollWheelZoom={false}
               className="leaflet-map"
             >
+              <MapBoundsFocus points={mainMapPoints} fallbackCenter={mainMapCenter} />
               <TileLayer
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -4681,6 +6448,13 @@ export function App() {
                   onClick={() => setFilters((current) => ({ ...current, selectedPhase: "all" }))}
                 >
                   All
+                </button>
+                <button
+                  type="button"
+                  className={`day-chip phase-chip ${filters.selectedPhase === "all_except_2_6" ? "active" : ""}`}
+                  onClick={() => setFilters((current) => ({ ...current, selectedPhase: "all_except_2_6" }))}
+                >
+                  All except P2/P6
                 </button>
                 {(corridor?.availablePhases ?? []).map((phase) => {
                   const value = String(phase);
@@ -5084,7 +6858,59 @@ export function App() {
             intersections={dashboard?.corridor.allIntersections ?? historicalDashboard?.corridor.allIntersections ?? []}
           />
         </main>
-      ) : activeView === "bottleneck" ? (
+      ) : activeView === "groupingPreview" ? (
+        <GroupingPreviewView
+          intersections={groupingPreviewIntersections}
+          availableDates={availableDates}
+          maxAvailableDate={maxAvailableDate}
+          availableDays={availableDays}
+          hourOptions={hourOptions}
+          dateFrom={groupingPreviewDateFrom}
+          dateTo={groupingPreviewDateTo}
+          onDateFromChange={setGroupingPreviewDateFrom}
+          onDateToChange={setGroupingPreviewDateTo}
+          daysOfWeek={groupingPreviewDaysOfWeek}
+          onDaysOfWeekChange={setGroupingPreviewDaysOfWeek}
+          hourFrom={groupingPreviewHourFrom}
+          hourTo={groupingPreviewHourTo}
+          onHourFromChange={setGroupingPreviewHourFrom}
+          onHourToChange={setGroupingPreviewHourTo}
+          moe={groupingPreviewMoe}
+          onMoeChange={setGroupingPreviewMoe}
+          threshold={groupingPreviewThreshold}
+          onThresholdChange={setGroupingPreviewThreshold}
+        />
+      ) : activeView === "correlationCliques" ? (
+        <CorrelationCliquesView
+          data={correlationCliquesData}
+          loading={correlationCliquesLoading}
+          error={correlationCliquesError}
+          filters={filters}
+          setFilters={setFilters}
+          availableDays={availableDays}
+          availableDates={availableDates}
+          maxAvailableDate={maxAvailableDate}
+          selectedMoe={correlationCliquesMoe}
+          onMoeChange={setCorrelationCliquesMoe}
+          threshold={correlationCliquesThreshold}
+          onThresholdChange={setCorrelationCliquesThreshold}
+        />
+      ) : activeView === "bottleneckDetection" ? (
+        <BottleneckDetectionView
+          data={bottleneckDetectionData}
+          loading={bottleneckDetectionLoading}
+          error={bottleneckDetectionError}
+          filters={filters}
+          setFilters={setFilters}
+          availableDays={availableDays}
+          availableDates={availableDates}
+          maxAvailableDate={maxAvailableDate}
+          selectedMoe={bottleneckDetectionMoe}
+          onMoeChange={setBottleneckDetectionMoe}
+          threshold={bottleneckDetectionThreshold}
+          onThresholdChange={setBottleneckDetectionThreshold}
+        />
+      ) : SHOW_CLUSTER_TABS && activeView === "bottleneck" ? (
         <BottleneckClusterView
           data={bottleneckData}
           loading={bottleneckLoading}
@@ -5108,7 +6934,7 @@ export function App() {
             })
           }
         />
-      ) : activeView === "hdbscan" ? (
+      ) : SHOW_CLUSTER_TABS && activeView === "hdbscan" ? (
         <HdbscanClusterView
           data={hdbscanData}
           loading={hdbscanLoading}

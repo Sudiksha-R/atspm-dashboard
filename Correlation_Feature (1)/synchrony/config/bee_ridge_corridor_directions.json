@@ -1,0 +1,156 @@
+{
+  "corridor_id": "demo_corridor_sr758",
+  "corridor_name": "Bee Ridge Rd corridor — demo subset A-F (intersections 1240-1245)",
+  "notes": "Hand-entered demo coordinates for prototype map development. Replace `intersections[*].lat/lon` with the authoritative intersection-metadata source before integrating into the main dashboard. To extend: (1) add an entry to `intersections`; (2) add a `pairwise_directions` entry with BOTH directions and their phase_groups. `direction` must be \"LR\" or \"RL\"; `phase_group` is the phase-group string the MoE retrieval layer expects.",
+  "intersections": [
+    {
+      "intersection_id": "1240",
+      "label": "A",
+      "corridor_order": 0,
+      "lat": 27.29874948916422,
+      "lon": -82.48095988074638
+    },
+    {
+      "intersection_id": "1241",
+      "label": "B",
+      "corridor_order": 1,
+      "lat": 27.298825745374703,
+      "lon": -82.46458987516009
+    },
+    {
+      "intersection_id": "1242",
+      "label": "C",
+      "corridor_order": 2,
+      "lat": 27.298780989599862,
+      "lon": -82.45823354279639
+    },
+    {
+      "intersection_id": "1243",
+      "label": "D",
+      "corridor_order": 3,
+      "lat": 27.29889661163669,
+      "lon": -82.45486023453539
+    },
+    {
+      "intersection_id": "1244",
+      "label": "E",
+      "corridor_order": 4,
+      "lat": 27.298835971236883,
+      "lon": -82.45158015206295
+    },
+    {
+      "intersection_id": "1245",
+      "label": "F",
+      "corridor_order": 5,
+      "lat": 27.298820585831997,
+      "lon": -82.44925166228474
+    }
+  ],
+  "pairwise_directions": [
+    {
+      "pair_id": "1240__1241",
+      "intersection_a": "1240",
+      "intersection_b": "1241",
+      "directions": [
+        {
+          "direction": "LR",
+          "travel_from": "1240",
+          "travel_to": "1241",
+          "phase_group": "phase2",
+          "travel_label": "A → B (eastbound)"
+        },
+        {
+          "direction": "RL",
+          "travel_from": "1241",
+          "travel_to": "1240",
+          "phase_group": "phase6",
+          "travel_label": "B → A (westbound)"
+        }
+      ]
+    },
+    {
+      "pair_id": "1241__1242",
+      "intersection_a": "1241",
+      "intersection_b": "1242",
+      "directions": [
+        {
+          "direction": "LR",
+          "travel_from": "1241",
+          "travel_to": "1242",
+          "phase_group": "phase2",
+          "travel_label": "B → C (eastbound)"
+        },
+        {
+          "direction": "RL",
+          "travel_from": "1242",
+          "travel_to": "1241",
+          "phase_group": "phase6",
+          "travel_label": "C → B (westbound)"
+        }
+      ]
+    },
+    {
+      "pair_id": "1242__1243",
+      "intersection_a": "1242",
+      "intersection_b": "1243",
+      "directions": [
+        {
+          "direction": "LR",
+          "travel_from": "1242",
+          "travel_to": "1243",
+          "phase_group": "phase2",
+          "travel_label": "C → D (eastbound)"
+        },
+        {
+          "direction": "RL",
+          "travel_from": "1243",
+          "travel_to": "1242",
+          "phase_group": "phase6",
+          "travel_label": "D → C (westbound)"
+        }
+      ]
+    },
+    {
+      "pair_id": "1243__1244",
+      "intersection_a": "1243",
+      "intersection_b": "1244",
+      "directions": [
+        {
+          "direction": "LR",
+          "travel_from": "1243",
+          "travel_to": "1244",
+          "phase_group": "phase2",
+          "travel_label": "D → E (eastbound)"
+        },
+        {
+          "direction": "RL",
+          "travel_from": "1244",
+          "travel_to": "1243",
+          "phase_group": "phase6",
+          "travel_label": "E → D (westbound)"
+        }
+      ]
+    },
+    {
+      "pair_id": "1244__1245",
+      "intersection_a": "1244",
+      "intersection_b": "1245",
+      "directions": [
+        {
+          "direction": "LR",
+          "travel_from": "1244",
+          "travel_to": "1245",
+          "phase_group": "phase2",
+          "travel_label": "E → F (eastbound)"
+        },
+        {
+          "direction": "RL",
+          "travel_from": "1245",
+          "travel_to": "1244",
+          "phase_group": "phase6",
+          "travel_label": "F → E (westbound)"
+        }
+      ]
+    }
+  ]
+}
