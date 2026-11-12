@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%files
+    backend/requirements.txt /opt/requirements.txt
+
+%post
+    apt-get update
+    apt-get install -y --no-install-recommends build-essential
+    rm -rf /var/lib/apt/lists/*
+    python -m pip install --upgrade pip
+    pip install --no-cache-dir -r /opt/requirements.txt
+
+%environment
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1

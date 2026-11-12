@@ -1,0 +1,12 @@
+pandas
+numpy
+scipy
+scikit-learn
+dask[dataframe]
+plotly
+networkx
+duckdb
+jinja2
+pyarrow
+pyarrow-hotfix
+traffic-anomaly>=2.4.0

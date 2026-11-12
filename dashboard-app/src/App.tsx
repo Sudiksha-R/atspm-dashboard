@@ -7,6 +7,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  ComposedChart,
   Legend,
   Line,
   LineChart,
@@ -22,9 +23,46 @@ import {
 const Plot = createPlotlyComponent(Plotly as never) as ComponentType<Record<string, unknown>>;
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000").replace(/\/$/, "");
 const apiUrl = (path: string, params: URLSearchParams) => `${API_BASE_URL}${path}?${params.toString()}`;
+const API_RESPONSE_CACHE = new Map<string, Response>();
+const API_REQUEST_CACHE_LIMIT = 48;
+const DEMO_DATE_FROM = "2026-03-01";
+const DEMO_DATE_TO = "2026-05-31";
+const DEMO_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+async function fetchApi(url: string, init: RequestInit = {}) {
+  const cached = API_RESPONSE_CACHE.get(url);
+  if (cached) {
+    return cached.clone();
+  }
+
+  // Pass the signal to the real network request so leaving a tab releases the
+  // browser connection instead of retaining an abandoned request indefinitely.
+  const response = await fetch(url, init);
+  if (response.ok) {
+    API_RESPONSE_CACHE.set(url, response.clone());
+    if (API_RESPONSE_CACHE.size > API_REQUEST_CACHE_LIMIT) {
+      API_RESPONSE_CACHE.delete(API_RESPONSE_CACHE.keys().next().value as string);
+    }
+  }
+  return response;
+}
 const SHOW_CLUSTER_TABS = false;
 const GROUPING_PALETTE = ["#6a3d9a", "#e6550d", "#1f78b4", "#c51b8a", "#b15928", "#252525"];
 const GROUPING_UNGROUPED = "#9aa0a6";
+
+type IntersectionSelectionPreset = {
+  id: "first-three" | "last-three" | "all";
+  label: string;
+  intersectionIds: string[];
+};
+
+function buildIntersectionSelectionPresets(intersectionIds: string[]): IntersectionSelectionPreset[] {
+  return [
+    { id: "first-three", label: "First three", intersectionIds: intersectionIds.slice(0, 3) },
+    { id: "last-three", label: "Last three", intersectionIds: intersectionIds.slice(-3) },
+    { id: "all", label: "All signals", intersectionIds },
+  ];
+}
 
 type MetricCard = {
   id: string;
@@ -115,6 +153,7 @@ type DashboardResponse = {
     timeOfDayPreset: string;
     selectedIntersectionIds: string[];
     selectedPhase: string;
+    selectedIntersectionPhases: Record<string, number>;
   };
   corridor: {
     id: string;
@@ -545,6 +584,7 @@ type HdbscanResponse = {
   filters: {
     signalIds: string[];
     phases: number[];
+    selectedIntersectionPhases: Record<string, number>;
     dateFrom: string;
     dateTo: string;
     daysOfWeek: string[];
@@ -766,6 +806,76 @@ type FilterState = {
   timeOfDayPreset: string;
   selectedPhase: string;
 };
+
+type IntersectionPhaseState = Record<string, string>;
+
+type ParsedIntersectionPhases = {
+  phases: IntersectionPhaseState;
+  error: string | null;
+};
+
+function parseIntersectionPhaseInput(rawValue: string, validIntersectionIds: string[]): ParsedIntersectionPhases {
+  const raw = rawValue.trim();
+  if (!raw) {
+    return { phases: {}, error: "Enter at least one intersection-phase pair." };
+  }
+
+  let pairs: Array<[string, unknown]> = [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed)) {
+      pairs = parsed.map((item) => {
+        if (!Array.isArray(item) || item.length !== 2) {
+          throw new Error("JSON arrays must contain [intersection, phase] pairs.");
+        }
+        return [String(item[0]), item[1]];
+      });
+    } else if (parsed && typeof parsed === "object") {
+      pairs = Object.entries(parsed as Record<string, unknown>);
+    } else {
+      throw new Error("JSON must be an object or an array of pairs.");
+    }
+  } catch (jsonError) {
+    if (raw.startsWith("{") || raw.startsWith("[")) {
+      return { phases: {}, error: (jsonError as Error).message };
+    }
+    const tokens = raw.split(/[;\n]+|,(?!\s*[1-8]\s*\))/).map((token) => token.trim()).filter(Boolean);
+    for (const token of tokens) {
+      const match = token.match(/^\(?\s*([^,:()\s-]+)\s*(?:-|:|,)\s*([1-8])\s*\)?$/);
+      if (!match) {
+        return { phases: {}, error: `Could not read “${token}”. Use intersection-phase pairs such as 1240-2.` };
+      }
+      pairs.push([match[1], match[2]]);
+    }
+  }
+
+  const validIds = new Set(validIntersectionIds);
+  const phases: IntersectionPhaseState = {};
+  for (const [rawIntersectionId, rawPhase] of pairs) {
+    const intersectionId = String(rawIntersectionId).trim();
+    const phase = String(rawPhase).trim();
+    if (!validIds.has(intersectionId)) {
+      return { phases: {}, error: `Intersection ${intersectionId} is not available in this dashboard.` };
+    }
+    if (!/^[1-8]$/.test(phase)) {
+      return { phases: {}, error: `Phase for intersection ${intersectionId} must be 1 through 8.` };
+    }
+    phases[intersectionId] = phase;
+  }
+
+  return Object.keys(phases).length
+    ? { phases, error: null }
+    : { phases: {}, error: "Enter at least one intersection-phase pair." };
+}
+
+function serializeIntersectionPhases(phases: IntersectionPhaseState, signalIds: string[]) {
+  const selected = new Set(signalIds);
+  const values = Object.entries(phases)
+    .filter(([signalId, phase]) => selected.has(signalId) && /^[1-8]$/.test(phase))
+    .sort(([left], [right]) => Number(left) - Number(right))
+    .map(([signalId, phase]) => `${signalId}:${phase}`);
+  return values.length ? values.join(",") : "__none__";
+}
 
 function buildDensityCurve(values: number[]) {
   const clean = values.filter((value) => Number.isFinite(value));
@@ -3293,6 +3403,8 @@ function BottleneckClusterView({
   minSamples: string;
   onMinSamplesChange: (value: string) => void;
 }) {
+  const [bulkPhaseInput, setBulkPhaseInput] = useState("");
+  const [bulkPhaseError, setBulkPhaseError] = useState<string | null>(null);
   const slotLookup = useMemo(
     () => new Map((data?.slots ?? []).map((slot) => [`${slot.dayName}-${slot.hour}`, slot])),
     [data?.slots]
@@ -3393,6 +3505,33 @@ function BottleneckClusterView({
                 </button>
               );
             })}
+          </div>
+          <div className="bulk-phase-selector bulk-phase-selector--inline">
+            <label htmlFor="bottleneck-intersection-phase">Intersection-phase pair</label>
+            <div className="bulk-phase-selector__controls">
+              <textarea
+                id="bottleneck-intersection-phase"
+                rows={1}
+                value={bulkPhaseInput}
+                placeholder="1240-2"
+                onChange={(event) => { setBulkPhaseInput(event.target.value); setBulkPhaseError(null); }}
+              />
+              <button type="button" className="preset-chip bulk-phase-selector__apply" onClick={() => {
+                const parsed = parseIntersectionPhaseInput(
+                  bulkPhaseInput,
+                  (data?.meta.availableSignals ?? []).map((signal) => signal.id)
+                );
+                const pairs = Object.entries(parsed.phases);
+                if (parsed.error || pairs.length !== 1) {
+                  setBulkPhaseError(parsed.error ?? "This view analyzes one intersection-phase pair at a time.");
+                  return;
+                }
+                onSignalChange(pairs[0][0]);
+                onPhaseChange(pairs[0][1]);
+                setBulkPhaseError(null);
+              }}>Apply</button>
+            </div>
+            {bulkPhaseError ? <span className="bulk-phase-selector__message error" role="alert">{bulkPhaseError}</span> : null}
           </div>
         </div>
 
@@ -3632,6 +3771,7 @@ function HdbscanClusterView({
   selectedSignalIds,
   onToggleSignal,
   onApplySignalPreset,
+  onApplyIntersectionPhases,
   selectedPhases,
   onTogglePhase,
   selectedMoes,
@@ -3649,6 +3789,7 @@ function HdbscanClusterView({
   selectedSignalIds: string[];
   onToggleSignal: (value: string) => void;
   onApplySignalPreset: (ids: string[]) => void;
+  onApplyIntersectionPhases: (phases: IntersectionPhaseState) => void;
   selectedPhases: string[];
   onTogglePhase: (value: string) => void;
   selectedMoes: string[];
@@ -3660,6 +3801,8 @@ function HdbscanClusterView({
   clusterSelectionEpsilon: string;
   onClusterSelectionEpsilonChange: (value: string) => void;
 }) {
+  const [bulkPhaseInput, setBulkPhaseInput] = useState("");
+  const [bulkPhaseError, setBulkPhaseError] = useState<string | null>(null);
   const slotLookup = useMemo(
     () => new Map((data?.slots ?? []).map((slot) => [`${slot.dayName}-${slot.hour}`, slot])),
     [data?.slots]
@@ -3671,6 +3814,10 @@ function HdbscanClusterView({
     .map((option) => option.label);
   const selectedSet = new Set(selectedSignalIds);
   const orderedSignals = availableSignals;
+  const intersectionSelectionPresets = useMemo(
+    () => buildIntersectionSelectionPresets(orderedSignals.map((signal) => signal.id)),
+    [orderedSignals]
+  );
   const mapCenter = useMemo<LatLngExpression>(() => {
     const active = orderedSignals.filter((signal) => selectedSet.has(signal.id));
     const base = active.length ? active : orderedSignals;
@@ -3746,7 +3893,7 @@ function HdbscanClusterView({
             <p className="section-kicker">Intersections</p>
             <p className="list-note">{selectedSignalIds.length} selected for HDBSCAN.</p>
             <div className="preset-row">
-              {(data?.meta.selectionPresets ?? []).map((preset) => (
+              {intersectionSelectionPresets.map((preset) => (
                 <button
                   key={preset.id}
                   type="button"
@@ -3828,6 +3975,32 @@ function HdbscanClusterView({
                 </button>
               );
             })}
+          </div>
+          <div className="bulk-phase-selector bulk-phase-selector--inline">
+            <label htmlFor="hdbscan-intersection-phases">Intersection-phase pairs</label>
+            <div className="bulk-phase-selector__controls">
+              <textarea
+                id="hdbscan-intersection-phases"
+                rows={2}
+                value={bulkPhaseInput}
+                placeholder={'1240-2, 1242-4\nor {"1240": 2, "1242": 4}'}
+                onChange={(event) => { setBulkPhaseInput(event.target.value); setBulkPhaseError(null); }}
+              />
+              <button type="button" className="preset-chip bulk-phase-selector__apply" onClick={() => {
+                const parsed = parseIntersectionPhaseInput(
+                  bulkPhaseInput,
+                  orderedSignals.map((signal) => signal.id)
+                );
+                if (parsed.error) {
+                  setBulkPhaseError(parsed.error);
+                  return;
+                }
+                onApplySignalPreset(orderedSignals.map((signal) => signal.id).filter((id) => Object.prototype.hasOwnProperty.call(parsed.phases, id)));
+                onApplyIntersectionPhases(parsed.phases);
+                setBulkPhaseError(null);
+              }}>Apply</button>
+            </div>
+            {bulkPhaseError ? <span className="bulk-phase-selector__message error" role="alert">{bulkPhaseError}</span> : null}
           </div>
         </div>
 
@@ -4135,26 +4308,10 @@ function ChangeDetectionView({
     };
   };
   const allSignalIds = useMemo(() => availableSignals.map((signal) => signal.id), [availableSignals]);
-  const visiblePresets = useMemo(() => {
-    const presets = data?.meta.selectionPresets ?? [];
-    return presets.filter((preset, index) => preset.label === "All signals" || (index >= 3 && index < presets.length - 3));
-  }, [data?.meta.selectionPresets]);
-
-  const applySelectionPreset = (presetIds: string[]) => {
-    const allSelected = allSignalIds.length > 0 && allSignalIds.every((id) => selectedSet.has(id));
-    const matchesAllSignals =
-      allSignalIds.length > 0 && presetIds.length === allSignalIds.length && presetIds.every((id) => allSignalIds.includes(id));
-
-    if (matchesAllSignals && allSelected) {
-      const fallback = allSignalIds.includes("1240") ? "1240" : allSignalIds[0];
-      if (fallback) {
-        onApplySignalPreset([fallback]);
-      }
-      return;
-    }
-
-    onApplySignalPreset(presetIds);
-  };
+  const intersectionSelectionPresets = useMemo(
+    () => buildIntersectionSelectionPresets(allSignalIds),
+    [allSignalIds]
+  );
 
   return (
     <main className="workspace ranking-workspace">
@@ -4217,12 +4374,12 @@ function ChangeDetectionView({
             <p className="list-note">{selectedSignalIds.length} selected for monitoring.</p>
             <p className="list-note list-note--helper">Click the map or the list to select or deselect intersections.</p>
             <div className="preset-row">
-              {visiblePresets.map((preset) => (
+              {intersectionSelectionPresets.map((preset) => (
                 <button
                   key={preset.id}
                   type="button"
                   className="preset-chip"
-                  onClick={() => applySelectionPreset(preset.intersectionIds)}
+                  onClick={() => onApplySignalPreset(preset.intersectionIds)}
                 >
                   {preset.label}
                 </button>
@@ -4656,6 +4813,7 @@ function GroupingPreviewView({
   onMoeChange,
   threshold,
   onThresholdChange,
+  onLoadingChange,
 }: {
   intersections: IntersectionPayload[];
   availableDates: string[];
@@ -4676,6 +4834,7 @@ function GroupingPreviewView({
   onMoeChange: (value: Exclude<RankingMetricKey, "compositeScore">) => void;
   threshold: string;
   onThresholdChange: (value: string) => void;
+  onLoadingChange: (loading: boolean) => void;
 }) {
   const orderedIntersections = useMemo(
     () => [...intersections].sort((left, right) => left.lon - right.lon),
@@ -4696,10 +4855,12 @@ function GroupingPreviewView({
       if (!orderedIntersections.length) {
         setGrouping(null);
         setLoadingGrouping(false);
+        onLoadingChange(false);
         return;
       }
       const startedAt = performance.now();
       setLoadingGrouping(true);
+      onLoadingChange(true);
       setGroupingError(null);
       try {
         const params = new URLSearchParams({
@@ -4712,7 +4873,7 @@ function GroupingPreviewView({
           moe,
           threshold,
         });
-        const response = await fetch(apiUrl("/api/grouping-preview", params), { signal: controller.signal });
+        const response = await fetchApi(apiUrl("/api/grouping-preview", params), { signal: controller.signal });
         if (!response.ok) {
           throw new Error(`Backend request failed with status ${response.status}`);
         }
@@ -4730,13 +4891,17 @@ function GroupingPreviewView({
         }
         if (!controller.signal.aborted) {
           setLoadingGrouping(false);
+          onLoadingChange(false);
         }
       }
     }
 
     loadGrouping();
-    return () => controller.abort();
-  }, [orderedIntersections, dateFrom, dateTo, daysOfWeek, hourFrom, hourTo, moe, threshold]);
+    return () => {
+      controller.abort();
+      onLoadingChange(false);
+    };
+  }, [orderedIntersections, dateFrom, dateTo, daysOfWeek, hourFrom, hourTo, moe, threshold, onLoadingChange]);
 
   const groups = useMemo(
     () => {
@@ -4756,26 +4921,6 @@ function GroupingPreviewView({
     },
     [grouping]
   );
-  const westToEastGroups = useMemo(() => groups.filter((group) => group.direction === "LR"), [groups]);
-  const eastToWestGroups = useMemo(() => groups.filter((group) => group.direction === "RL"), [groups]);
-  const westToEastMarkerColors = useMemo(() => {
-    const colors = new Map<string, string[]>();
-    westToEastGroups.forEach((group) => {
-      group.ids.forEach((id) => {
-        colors.set(id, [...(colors.get(id) ?? []), group.color]);
-      });
-    });
-    return colors;
-  }, [westToEastGroups]);
-  const eastToWestMarkerColors = useMemo(() => {
-    const colors = new Map<string, string[]>();
-    eastToWestGroups.forEach((group) => {
-      group.ids.forEach((id) => {
-        colors.set(id, [...(colors.get(id) ?? []), group.color]);
-      });
-    });
-    return colors;
-  }, [eastToWestGroups]);
   const clusterSummaries = Object.values(grouping?.results ?? {}).flatMap((directionResult) =>
     (directionResult.groups ?? []).map((group, index) => ({
       id: group.group_id,
@@ -4959,61 +5104,39 @@ function GroupingPreviewView({
         </div>
 
         <div className="grouping-map-shell">
-          <div className="grouping-map-grid">
-            <article className="grouping-map-panel">
-              <div className="grouping-map-panel__header">
-                <span>West-to-east</span>
-                <strong>LR / Eastbound</strong>
+          <article className="grouping-map-panel">
+            <div className="grouping-map-panel__header">
+              <span>Bee Ridge Road corridor · 14 intersections</span>
+              <div className="grouping-direction-legend" aria-label="Direction placement">
+                <strong className="grouping-direction-legend__west">Westbound above</strong>
+                <strong className="grouping-direction-legend__east">Eastbound below</strong>
               </div>
-              <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} className="leaflet-map grouping-map">
-                <TileLayer
-                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                />
-                {orderedIntersections.map((intersection) => (
-                  <Marker
-                    key={intersection.id}
-                    position={[intersection.lat, intersection.lon]}
-                    icon={buildGroupingMarkerIcon(westToEastMarkerColors.get(intersection.id) ?? [])}
-                  >
-                    <Popup>
-                      <strong>{intersection.name}</strong>
-                      <br />
-                      Signal ID {intersection.id}
-                    </Popup>
-                  </Marker>
-                ))}
-                <GroupingBoxesOverlay groups={westToEastGroups} intersections={lookup} />
-              </MapContainer>
-            </article>
-
-            <article className="grouping-map-panel">
-              <div className="grouping-map-panel__header">
-                <span>East-to-west</span>
-                <strong>RL / Westbound</strong>
-              </div>
-              <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} className="leaflet-map grouping-map">
-                <TileLayer
-                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                />
-                {orderedIntersections.map((intersection) => (
-                  <Marker
-                    key={intersection.id}
-                    position={[intersection.lat, intersection.lon]}
-                    icon={buildGroupingMarkerIcon(eastToWestMarkerColors.get(intersection.id) ?? [])}
-                  >
-                    <Popup>
-                      <strong>{intersection.name}</strong>
-                      <br />
-                      Signal ID {intersection.id}
-                    </Popup>
-                  </Marker>
-                ))}
-                <GroupingBoxesOverlay groups={eastToWestGroups} intersections={lookup} />
-              </MapContainer>
-            </article>
-          </div>
+            </div>
+            <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} className="leaflet-map grouping-map grouping-map--combined">
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
+              <Polyline
+                positions={orderedIntersections.map((intersection) => [intersection.lat, intersection.lon] as LatLngExpression)}
+                pathOptions={{ color: "#183f35", weight: 5, opacity: 0.82 }}
+              />
+              {orderedIntersections.map((intersection) => (
+                <Marker
+                  key={intersection.id}
+                  position={[intersection.lat, intersection.lon]}
+                  icon={buildGroupingMarkerIcon([])}
+                >
+                  <Popup>
+                    <strong>{intersection.name}</strong>
+                    <br />
+                    Signal ID {intersection.id}
+                  </Popup>
+                </Marker>
+              ))}
+              <GroupingBoxesOverlay groups={groups} intersections={lookup} />
+            </MapContainer>
+          </article>
           {groupingLoading ? (
             <div className="grouping-loading-overlay" aria-live="polite">
               <div className="grouping-loading-card">
@@ -5120,8 +5243,11 @@ function GroupingBoxesOverlay({
           const last = members[members.length - 1];
           const firstPoint = map.latLngToContainerPoint([first.lat, first.lon]);
           const lastPoint = map.latLngToContainerPoint([last.lat, last.lon]);
-          const origin = group.direction === "RL" ? lastPoint : firstPoint;
-          const dest = group.direction === "RL" ? firstPoint : lastPoint;
+          const unshiftedOrigin = group.direction === "RL" ? lastPoint : firstPoint;
+          const unshiftedDest = group.direction === "RL" ? firstPoint : lastPoint;
+          const laneOffset = group.direction === "LR" ? 46 : -46;
+          const origin = { x: unshiftedOrigin.x, y: unshiftedOrigin.y + laneOffset };
+          const dest = { x: unshiftedDest.x, y: unshiftedDest.y + laneOffset };
           const dx = dest.x - origin.x;
           const dy = dest.y - origin.y;
           const span = Math.max(1, Math.hypot(dx, dy));
@@ -5207,7 +5333,18 @@ function insightBlock(title: string, what: string, meaning: string) {
   );
 }
 
+function TabLoadingIndicator({ loading }: { loading: boolean }) {
+  return loading ? (
+    <span className="tab-loading-indicator" aria-label="Calculation in progress" role="status">
+      <span className="tab-loading-spinner" aria-hidden="true" />
+      <span className="tab-loading-label">Loading</span>
+    </span>
+  ) : null;
+}
+
 export function App() {
+  const skipNormalizedDashboardUrl = useRef<string | null>(null);
+  const skipNormalizedHistoricalDashboardUrl = useRef<string | null>(null);
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [historicalDashboard, setHistoricalDashboard] = useState<DashboardResponse | null>(null);
   const [activeView, setActiveView] = useState<"dashboard" | "historicalDashboard" | "historical" | "ranking" | "dayHour" | "groupingPreview" | "correlationCliques" | "bottleneckDetection" | "bottleneck" | "hdbscan" | "changeDetection">("historicalDashboard");
@@ -5219,7 +5356,7 @@ export function App() {
   const [bottleneckData, setBottleneckData] = useState<BottleneckResponse | null>(null);
   const [hdbscanData, setHdbscanData] = useState<HdbscanResponse | null>(null);
   const [changeDetectionData, setChangeDetectionData] = useState<ChangeDetectionResponse | null>(null);
-  const [historicalSignalId, setHistoricalSignalId] = useState("1470");
+  const [historicalSignalId, setHistoricalSignalId] = useState("1240");
   const [dayHourMetric, setDayHourMetric] = useState<Exclude<RankingMetricKey, "compositeScore">>("avgWait");
   const [bottleneckDetectionMoe, setBottleneckDetectionMoe] = useState<Exclude<RankingMetricKey, "compositeScore">>("aorPct");
   const [bottleneckDetectionThreshold, setBottleneckDetectionThreshold] = useState("60");
@@ -5232,6 +5369,7 @@ export function App() {
   const [bottleneckMinSamples, setBottleneckMinSamples] = useState("2");
   const [hdbscanSignalIds, setHdbscanSignalIds] = useState<string[]>([]);
   const [hdbscanPhases, setHdbscanPhases] = useState<string[]>(["1"]);
+  const [hdbscanIntersectionPhases, setHdbscanIntersectionPhases] = useState<IntersectionPhaseState>({});
   const [hdbscanMoes, setHdbscanMoes] = useState<string[]>(["aogPct", "aorPct", "volume", "avgWait", "splitFailures"]);
   const [hdbscanMinClusterSize, setHdbscanMinClusterSize] = useState("6");
   const [hdbscanMinSamples, setHdbscanMinSamples] = useState("3");
@@ -5239,19 +5377,19 @@ export function App() {
   const [changeDetectionSignalIds, setChangeDetectionSignalIds] = useState<string[]>([]);
   const [changeDetectionMoe, setChangeDetectionMoe] = useState<Exclude<RankingMetricKey, "compositeScore">>("avgWait");
   const [changeDetectionGranularity, setChangeDetectionGranularity] = useState<"day" | "hour">("hour");
-  const [changeDetectionSelectedDate, setChangeDetectionSelectedDate] = useState("2026-03-04");
+  const [changeDetectionSelectedDate, setChangeDetectionSelectedDate] = useState("2026-05-18");
   const [changeDetectionSelectedHour, setChangeDetectionSelectedHour] = useState("06:00");
-  const [groupingPreviewDateFrom, setGroupingPreviewDateFrom] = useState("2026-02-02");
-  const [groupingPreviewDateTo, setGroupingPreviewDateTo] = useState("2026-03-04");
-  const [groupingPreviewDaysOfWeek, setGroupingPreviewDaysOfWeek] = useState<string[]>(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]);
+  const [groupingPreviewDateFrom, setGroupingPreviewDateFrom] = useState(DEMO_DATE_FROM);
+  const [groupingPreviewDateTo, setGroupingPreviewDateTo] = useState(DEMO_DATE_TO);
+  const [groupingPreviewDaysOfWeek, setGroupingPreviewDaysOfWeek] = useState<string[]>(DEMO_DAYS);
   const [groupingPreviewHourFrom, setGroupingPreviewHourFrom] = useState("06:00");
   const [groupingPreviewHourTo, setGroupingPreviewHourTo] = useState("18:00");
   const [groupingPreviewMoe, setGroupingPreviewMoe] = useState<Exclude<RankingMetricKey, "compositeScore">>("avgWait");
   const [groupingPreviewThreshold, setGroupingPreviewThreshold] = useState("0.25");
   const [filters, setFilters] = useState<FilterState>({
-    dateFrom: "",
-    dateTo: "",
-    daysOfWeek: [],
+    dateFrom: DEMO_DATE_FROM,
+    dateTo: DEMO_DATE_TO,
+    daysOfWeek: DEMO_DAYS,
     hourFrom: "06:00",
     hourTo: "18:00",
     timeOfDayPreset: "custom",
@@ -5259,7 +5397,10 @@ export function App() {
   });
   const [selectedIntersectionIds, setSelectedIntersectionIds] = useState<string[]>([]);
   const [historicalDashboardIntersectionIds, setHistoricalDashboardIntersectionIds] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [intersectionPhases, setIntersectionPhases] = useState<IntersectionPhaseState>({});
+  const [bulkPhaseInput, setBulkPhaseInput] = useState("");
+  const [bulkPhaseMessage, setBulkPhaseMessage] = useState<{ tone: "error" | "success"; text: string } | null>(null);
+  const [loading, setLoading] = useState(false);
   const [historicalDashboardLoading, setHistoricalDashboardLoading] = useState(false);
   const [historicalLoading, setHistoricalLoading] = useState(false);
   const [rankingLoading, setRankingLoading] = useState(false);
@@ -5269,6 +5410,7 @@ export function App() {
   const [bottleneckLoading, setBottleneckLoading] = useState(false);
   const [hdbscanLoading, setHdbscanLoading] = useState(false);
   const [changeDetectionLoading, setChangeDetectionLoading] = useState(false);
+  const [groupingPreviewLoading, setGroupingPreviewLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [historicalDashboardError, setHistoricalDashboardError] = useState<string | null>(null);
   const [historicalError, setHistoricalError] = useState<string | null>(null);
@@ -5289,6 +5431,10 @@ export function App() {
       hourTo: filters.hourTo,
       timeOfDayPreset: filters.timeOfDayPreset,
       phase: filters.selectedPhase,
+      intersectionPhases: serializeIntersectionPhases(
+        intersectionPhases,
+        intersectionIdsOverride ?? selectedIntersectionIds
+      ),
       intersectionIds: (intersectionIdsOverride ?? selectedIntersectionIds).join(",")
     });
 
@@ -5301,6 +5447,10 @@ export function App() {
       hourTo: filters.hourTo,
       timeOfDayPreset: filters.timeOfDayPreset,
       phase: filters.selectedPhase,
+      intersectionPhases: serializeIntersectionPhases(
+        intersectionPhases,
+        intersectionIdsOverride ?? historicalDashboardIntersectionIds
+      ),
       intersectionIds: (intersectionIdsOverride ?? historicalDashboardIntersectionIds).join(",")
     });
 
@@ -5314,15 +5464,38 @@ export function App() {
       setLoading(true);
       setError(null);
       const params = buildDashboardParams();
+      const url = apiUrl("/api/dashboard", params);
+      if (skipNormalizedDashboardUrl.current === url) {
+        skipNormalizedDashboardUrl.current = null;
+        setLoading(false);
+        return;
+      }
+      skipNormalizedDashboardUrl.current = null;
 
       try {
-        const response = await fetch(apiUrl("/api/dashboard", params), {
+        const response = await fetchApi(url, {
           signal: controller.signal
         });
         if (!response.ok) {
           throw new Error(`Backend request failed with status ${response.status}`);
         }
         const nextDashboard: DashboardResponse = await response.json();
+        skipNormalizedDashboardUrl.current = apiUrl("/api/dashboard", new URLSearchParams({
+          dateFrom: nextDashboard.filters.dateFrom,
+          dateTo: nextDashboard.filters.dateTo,
+          daysOfWeek: nextDashboard.filters.daysOfWeek.join(","),
+          hourFrom: nextDashboard.filters.hourFrom,
+          hourTo: nextDashboard.filters.hourTo,
+          timeOfDayPreset: nextDashboard.filters.timeOfDayPreset,
+          phase: nextDashboard.filters.selectedPhase,
+          intersectionPhases: serializeIntersectionPhases(
+            Object.fromEntries(
+              Object.entries(nextDashboard.filters.selectedIntersectionPhases ?? {}).map(([id, phase]) => [id, String(phase)])
+            ),
+            nextDashboard.filters.selectedIntersectionIds
+          ),
+          intersectionIds: nextDashboard.filters.selectedIntersectionIds.join(",")
+        }));
         setDashboard(nextDashboard);
         setFilters({
           dateFrom: nextDashboard.filters.dateFrom,
@@ -5334,6 +5507,14 @@ export function App() {
           selectedPhase: nextDashboard.filters.selectedPhase
         });
         setSelectedIntersectionIds(nextDashboard.filters.selectedIntersectionIds);
+        setIntersectionPhases((current) => {
+          const normalized = { ...current };
+          nextDashboard.filters.selectedIntersectionIds.forEach((id) => delete normalized[id]);
+          Object.entries(nextDashboard.filters.selectedIntersectionPhases ?? {}).forEach(([id, phase]) => {
+            normalized[id] = String(phase);
+          });
+          return normalized;
+        });
       } catch (requestError) {
         if ((requestError as Error).name !== "AbortError") {
           setError((requestError as Error).message);
@@ -5354,7 +5535,8 @@ export function App() {
     filters.hourTo,
     filters.timeOfDayPreset,
     filters.selectedPhase,
-    selectedIntersectionIds.join(",")
+    selectedIntersectionIds.join(","),
+    serializeIntersectionPhases(intersectionPhases, selectedIntersectionIds)
   ]);
 
   useEffect(() => {
@@ -5367,15 +5549,38 @@ export function App() {
       setHistoricalDashboardLoading(true);
       setHistoricalDashboardError(null);
       const params = buildHistoricalDashboardParams();
+      const url = apiUrl("/api/historical-dashboard", params);
+      if (skipNormalizedHistoricalDashboardUrl.current === url) {
+        skipNormalizedHistoricalDashboardUrl.current = null;
+        setHistoricalDashboardLoading(false);
+        return;
+      }
+      skipNormalizedHistoricalDashboardUrl.current = null;
 
       try {
-        const response = await fetch(apiUrl("/api/historical-dashboard", params), {
+        const response = await fetchApi(url, {
           signal: controller.signal
         });
         if (!response.ok) {
           throw new Error(`Backend request failed with status ${response.status}`);
         }
         const nextDashboard: DashboardResponse = await response.json();
+        skipNormalizedHistoricalDashboardUrl.current = apiUrl("/api/historical-dashboard", new URLSearchParams({
+          dateFrom: nextDashboard.filters.dateFrom,
+          dateTo: nextDashboard.filters.dateTo,
+          daysOfWeek: nextDashboard.filters.daysOfWeek.join(","),
+          hourFrom: nextDashboard.filters.hourFrom,
+          hourTo: nextDashboard.filters.hourTo,
+          timeOfDayPreset: nextDashboard.filters.timeOfDayPreset,
+          phase: nextDashboard.filters.selectedPhase,
+          intersectionPhases: serializeIntersectionPhases(
+            Object.fromEntries(
+              Object.entries(nextDashboard.filters.selectedIntersectionPhases ?? {}).map(([id, phase]) => [id, String(phase)])
+            ),
+            nextDashboard.filters.selectedIntersectionIds
+          ),
+          intersectionIds: nextDashboard.filters.selectedIntersectionIds.join(",")
+        }));
         setHistoricalDashboard(nextDashboard);
         setFilters({
           dateFrom: nextDashboard.filters.dateFrom,
@@ -5387,6 +5592,14 @@ export function App() {
           selectedPhase: nextDashboard.filters.selectedPhase
         });
         setHistoricalDashboardIntersectionIds(nextDashboard.filters.selectedIntersectionIds);
+        setIntersectionPhases((current) => {
+          const normalized = { ...current };
+          nextDashboard.filters.selectedIntersectionIds.forEach((id) => delete normalized[id]);
+          Object.entries(nextDashboard.filters.selectedIntersectionPhases ?? {}).forEach(([id, phase]) => {
+            normalized[id] = String(phase);
+          });
+          return normalized;
+        });
       } catch (requestError) {
         if ((requestError as Error).name !== "AbortError") {
           setHistoricalDashboardError((requestError as Error).message);
@@ -5407,7 +5620,8 @@ export function App() {
     filters.hourTo,
     filters.timeOfDayPreset,
     filters.selectedPhase,
-    historicalDashboardIntersectionIds.join(",")
+    historicalDashboardIntersectionIds.join(","),
+    serializeIntersectionPhases(intersectionPhases, historicalDashboardIntersectionIds)
   ]);
 
   useEffect(() => {
@@ -5428,7 +5642,7 @@ export function App() {
           hourTo: filters.hourTo,
           timeOfDayPreset: filters.timeOfDayPreset
         });
-        const response = await fetch(apiUrl("/api/ranking", params), {
+        const response = await fetchApi(apiUrl("/api/ranking", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -5469,7 +5683,7 @@ export function App() {
       setHistoricalError(null);
       try {
         const params = new URLSearchParams({ signalId: historicalSignalId });
-        const response = await fetch(apiUrl("/api/historical-run", params), {
+        const response = await fetchApi(apiUrl("/api/historical-run", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -5513,7 +5727,7 @@ export function App() {
           hourTo: filters.hourTo,
           timeOfDayPreset: filters.timeOfDayPreset
         });
-        const response = await fetch(apiUrl("/api/day-hour", params), {
+        const response = await fetchApi(apiUrl("/api/day-hour", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -5563,7 +5777,7 @@ export function App() {
           moe: bottleneckDetectionMoe,
           threshold: bottleneckDetectionThreshold,
         });
-        const response = await fetch(apiUrl("/api/bottleneck-detection", params), {
+        const response = await fetchApi(apiUrl("/api/bottleneck-detection", params), {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -5612,7 +5826,7 @@ export function App() {
           moe: correlationCliquesMoe,
           threshold: correlationCliquesThreshold,
         });
-        const response = await fetch(apiUrl("/api/correlation-cliques", params), {
+        const response = await fetchApi(apiUrl("/api/correlation-cliques", params), {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -5661,7 +5875,7 @@ export function App() {
           eps: bottleneckEps,
           minSamples: bottleneckMinSamples,
         });
-        const response = await fetch(apiUrl("/api/bottleneck-clusters", params), {
+        const response = await fetchApi(apiUrl("/api/bottleneck-clusters", params), {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -5699,12 +5913,13 @@ export function App() {
         const params = new URLSearchParams({
           signalIds: hdbscanSignalIds.join(","),
           phases: hdbscanPhases.join(","),
+          intersectionPhases: serializeIntersectionPhases(hdbscanIntersectionPhases, hdbscanSignalIds),
           moes: hdbscanMoes.join(","),
           minClusterSize: hdbscanMinClusterSize,
           minSamples: hdbscanMinSamples,
           clusterSelectionEpsilon: hdbscanClusterSelectionEpsilon,
         });
-        const response = await fetch(apiUrl("/api/hdbscan-clusters", params), {
+        const response = await fetchApi(apiUrl("/api/hdbscan-clusters", params), {
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -5714,6 +5929,9 @@ export function App() {
         setHdbscanData(nextData);
         setHdbscanSignalIds(nextData.filters.signalIds);
         setHdbscanPhases(nextData.filters.phases.map(String));
+        setHdbscanIntersectionPhases(
+          Object.fromEntries(Object.entries(nextData.filters.selectedIntersectionPhases ?? {}).map(([id, phase]) => [id, String(phase)]))
+        );
         setHdbscanMinClusterSize(String(nextData.filters.minClusterSize));
         setHdbscanMinSamples(String(nextData.filters.minSamples));
         setHdbscanClusterSelectionEpsilon(String(nextData.filters.clusterSelectionEpsilon));
@@ -5732,6 +5950,7 @@ export function App() {
     activeView,
     hdbscanSignalIds.join(","),
     hdbscanPhases.join(","),
+    serializeIntersectionPhases(hdbscanIntersectionPhases, hdbscanSignalIds),
     hdbscanMoes.join(","),
     hdbscanMinClusterSize,
     hdbscanMinSamples,
@@ -5760,7 +5979,7 @@ export function App() {
           selectedDate: changeDetectionSelectedDate,
           selectedHour: changeDetectionSelectedHour,
         });
-        const response = await fetch(apiUrl("/api/change-detection", params), {
+        const response = await fetchApi(apiUrl("/api/change-detection", params), {
           signal: controller.signal
         });
         if (!response.ok) {
@@ -5817,6 +6036,37 @@ export function App() {
     });
   };
 
+  const updateIntersectionPhase = (intersectionId: string, rawValue: string) => {
+    const nextValue = rawValue.replace(/[^1-8]/g, "").slice(0, 1);
+    setIntersectionPhases((current) => {
+      if (!nextValue) {
+        const next = { ...current };
+        delete next[intersectionId];
+        return next;
+      }
+      return { ...current, [intersectionId]: nextValue };
+    });
+  };
+
+  const applyBulkIntersectionPhases = () => {
+    const orderedIds = corridorOrderedIntersections.map((intersection) => intersection.id);
+    const parsed = parseIntersectionPhaseInput(bulkPhaseInput, orderedIds);
+    if (parsed.error) {
+      setBulkPhaseMessage({ tone: "error", text: parsed.error });
+      return;
+    }
+
+    const selectedIds = orderedIds.filter((id) => Object.prototype.hasOwnProperty.call(parsed.phases, id));
+    const setIds = isHistoricalDashboardView ? setHistoricalDashboardIntersectionIds : setSelectedIntersectionIds;
+    setIds(selectedIds);
+    setIntersectionPhases(parsed.phases);
+    setFilters((current) => ({ ...current, selectedPhase: "all" }));
+    setBulkPhaseMessage({
+      tone: "success",
+      text: `Applied ${selectedIds.length} intersection-phase ${selectedIds.length === 1 ? "pair" : "pairs"}.`,
+    });
+  };
+
   const toggleHdbscanSignalSelection = (intersectionId: string) => {
     setHdbscanSignalIds((current) => {
       const active = current.includes(intersectionId);
@@ -5830,6 +6080,7 @@ export function App() {
   };
 
   const toggleHdbscanPhase = (phase: string) => {
+    setHdbscanIntersectionPhases({});
     setHdbscanPhases((current) => {
       const active = current.includes(phase);
       if (active && current.length === 1) {
@@ -5922,6 +6173,11 @@ export function App() {
       });
   }, [allIntersections, rankedIntersections]);
 
+  const dashboardSelectionPresets = useMemo(
+    () => buildIntersectionSelectionPresets(corridorOrderedIntersections.map((intersection) => intersection.id)),
+    [corridorOrderedIntersections]
+  );
+
   const corridorPath = useMemo(
     () => intersections.map((intersection) => [intersection.lat, intersection.lon] as LatLngExpression),
     [intersections]
@@ -5974,6 +6230,7 @@ export function App() {
     const rows = intersections.flatMap((intersection) =>
       intersection.phases.map((phase) => ({
         phase: `P${phase.phase}`,
+        splitLength: phase.greenTime,
         splitFailures: phase.splitFailures,
         maxOuts: phase.maxOuts,
         gapOuts: phase.gapOuts,
@@ -5981,15 +6238,32 @@ export function App() {
       }))
     );
 
-    const byPhase = new Map<string, { phase: string; splitFailures: number; maxOuts: number; gapOuts: number; forceOffs: number }>();
+    const byPhase = new Map<string, {
+      phase: string;
+      splitLengthTotal: number;
+      splitLengthCount: number;
+      averageSplitLength: number;
+      splitFailures: number;
+      maxOuts: number;
+      gapOuts: number;
+      forceOffs: number;
+    }>();
     rows.forEach((row) => {
       const current = byPhase.get(row.phase) ?? {
         phase: row.phase,
+        splitLengthTotal: 0,
+        splitLengthCount: 0,
+        averageSplitLength: 0,
         splitFailures: 0,
         maxOuts: 0,
         gapOuts: 0,
         forceOffs: 0
       };
+      if (Number.isFinite(row.splitLength) && row.splitLength > 0) {
+        current.splitLengthTotal += row.splitLength;
+        current.splitLengthCount += 1;
+        current.averageSplitLength = current.splitLengthTotal / current.splitLengthCount;
+      }
       current.splitFailures += row.splitFailures;
       current.maxOuts += row.maxOuts;
       current.gapOuts += row.gapOuts;
@@ -6049,7 +6323,7 @@ export function App() {
             gap_outs: "Gap-Outs",
             force_offs: "Force-Offs",
             skips: "Skips",
-            phase_green_time: "Green Time"
+            phase_green_time: "Average Split Length"
           }[key] ?? key,
         meaning
       })),
@@ -6062,7 +6336,7 @@ export function App() {
     : fallbackTimeOfDayPresets;
   const availableDays = currentDashboard?.meta.availableDays.length ? currentDashboard.meta.availableDays : fallbackDays;
   const availableDates = currentDashboard?.meta.availableDates ?? [];
-  const maxAvailableDate = availableDates.length ? availableDates[availableDates.length - 1] : undefined;
+  const maxAvailableDate = DEMO_DATE_TO;
   const groupingPreviewIntersections = currentDashboard?.corridor.allIntersections ?? historicalDashboard?.corridor.allIntersections ?? [];
   const mainMapPoints = useMemo(
     () =>
@@ -6072,6 +6346,19 @@ export function App() {
     [corridorOrderedIntersections]
   );
   const mainMapCenter = mainMapPoints[0] ?? ([27.2989, -82.48] as LatLngExpression);
+  const activeCalculation = {
+    historicalDashboard: { loading: historicalDashboardLoading, label: "Loading dashboard calculations..." },
+    historical: { loading: historicalLoading, label: "Loading intersection analysis..." },
+    ranking: { loading: rankingLoading, label: "Calculating corridor rankings..." },
+    dayHour: { loading: dayHourLoading, label: "Calculating the day-hour view..." },
+    groupingPreview: { loading: groupingPreviewLoading, label: "Calculating intersection groups..." },
+    correlationCliques: { loading: correlationCliquesLoading, label: "Calculating correlation cliques..." },
+    bottleneckDetection: { loading: bottleneckDetectionLoading, label: "Calculating bottleneck volumes..." },
+    bottleneck: { loading: bottleneckLoading, label: "Calculating bottleneck clusters..." },
+    hdbscan: { loading: hdbscanLoading, label: "Calculating HDBSCAN clusters..." },
+    changeDetection: { loading: changeDetectionLoading, label: "Calculating change detections..." },
+    dashboard: { loading, label: "Running the ad hoc ATSPM query..." },
+  }[activeView];
 
   return (
     <div className="app-shell">
@@ -6088,6 +6375,7 @@ export function App() {
           onClick={() => setActiveView("historicalDashboard")}
         >
           Dashboard
+          <TabLoadingIndicator loading={historicalDashboardLoading} />
         </button>
         <button
           type="button"
@@ -6095,6 +6383,7 @@ export function App() {
           onClick={() => setActiveView("historical")}
         >
           Intersection-wise Analysis
+          <TabLoadingIndicator loading={historicalLoading} />
         </button>
         <button
           type="button"
@@ -6102,6 +6391,7 @@ export function App() {
           onClick={() => setActiveView("ranking")}
         >
           Ranking
+          <TabLoadingIndicator loading={rankingLoading} />
         </button>
         <button
           type="button"
@@ -6109,6 +6399,7 @@ export function App() {
           onClick={() => setActiveView("dayHour")}
         >
           Day-Hour View
+          <TabLoadingIndicator loading={dayHourLoading} />
         </button>
         <button
           type="button"
@@ -6116,6 +6407,7 @@ export function App() {
           onClick={() => setActiveView("groupingPreview")}
         >
           Grouping Intersections
+          <TabLoadingIndicator loading={groupingPreviewLoading} />
         </button>
         <button
           type="button"
@@ -6123,6 +6415,7 @@ export function App() {
           onClick={() => setActiveView("correlationCliques")}
         >
           Correlation Cliques
+          <TabLoadingIndicator loading={correlationCliquesLoading} />
         </button>
         <button
           type="button"
@@ -6130,6 +6423,7 @@ export function App() {
           onClick={() => setActiveView("bottleneckDetection")}
         >
           Bottleneck Detection
+          <TabLoadingIndicator loading={bottleneckDetectionLoading} />
         </button>
         {SHOW_CLUSTER_TABS ? (
           <>
@@ -6139,6 +6433,7 @@ export function App() {
               onClick={() => setActiveView("bottleneck")}
             >
               Bottleneck Clusters
+              <TabLoadingIndicator loading={bottleneckLoading} />
             </button>
             <button
               type="button"
@@ -6146,6 +6441,7 @@ export function App() {
               onClick={() => setActiveView("hdbscan")}
             >
               HDBSCAN Clusters
+              <TabLoadingIndicator loading={hdbscanLoading} />
             </button>
           </>
         ) : null}
@@ -6155,6 +6451,7 @@ export function App() {
           onClick={() => setActiveView("changeDetection")}
         >
           Change Detection
+          <TabLoadingIndicator loading={changeDetectionLoading} />
         </button>
         <button
           type="button"
@@ -6162,8 +6459,19 @@ export function App() {
           onClick={() => setActiveView("dashboard")}
         >
           Ad Hoc Queries
+          <TabLoadingIndicator loading={loading} />
         </button>
       </nav>
+
+      {activeCalculation.loading ? (
+        <div className="status-banner calculation-status-banner" role="status" aria-live="polite">
+          <span className="calculation-status-spinner" aria-hidden="true" />
+          <div>
+            <strong>{activeCalculation.label}</strong>
+            <span>You can switch tabs; this indicator will disappear when the result is ready.</span>
+          </div>
+        </div>
+      ) : null}
 
       {currentDashboard?.meta.note ? <div className="status-banner">{currentDashboard.meta.note}</div> : null}
       {currentDashboardError ? <div className="status-banner error">{currentDashboardError}</div> : null}
@@ -6245,7 +6553,7 @@ export function App() {
                   : `${corridorOrderedIntersections.length} mapped signals shown in corridor order.`}
               </p>
               <div className="preset-row">
-                {(currentDashboard?.meta.selectionPresets ?? []).map((preset) => (
+                {dashboardSelectionPresets.map((preset) => (
                   <button
                     key={preset.id}
                     type="button"
@@ -6263,9 +6571,9 @@ export function App() {
               {corridorOrderedIntersections.map((intersection) => {
                 const active = currentSelectedIntersectionIds.includes(intersection.id);
                 return (
-                  <label
+                  <div
                     key={intersection.id}
-                    className={`intersection-row tone-${intersection.category} ${active ? "active" : ""}`}
+                    className={`intersection-row intersection-row--with-phase tone-${intersection.category} ${active ? "active" : ""}`}
                   >
                     <input
                       type="checkbox"
@@ -6283,7 +6591,21 @@ export function App() {
                           : " · No aggregated ATSPM data in the current filter"}
                       </span>
                     </div>
-                  </label>
+                    <label className="intersection-phase-field">
+                      <span>Phase</span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={1}
+                        value={intersectionPhases[intersection.id] ?? ""}
+                        placeholder={filters.selectedPhase === "all" ? "Any" : filters.selectedPhase === "all_except_2_6" ? "Other" : `P${filters.selectedPhase}`}
+                        disabled={!active}
+                        aria-label={`Phase for ${intersection.name}`}
+                        title="Enter phase 1 through 8. Clear the box to use the global phase selection."
+                        onChange={(event) => updateIntersectionPhase(intersection.id, event.target.value)}
+                      />
+                    </label>
+                  </div>
                 );
               })}
             </aside>
@@ -6421,10 +6743,10 @@ export function App() {
         <section className="panel phase-operations-panel">
           <div className="section-header">
             <div>
-              <p className="section-kicker">Overview</p>
-              <h2>Compact ATSPM metrics</h2>
+              <p className="section-kicker">Corridor Overview · Phases 2 &amp; 6</p>
+              <h2>Corridor-direction ATSPM metrics</h2>
             </div>
-            <p className="section-copy">Each metric includes a quick tooltip definition.</p>
+            <p className="section-copy">Overall corridor MOEs include only the coordinated through phases. Side-street and other non-corridor phases are excluded.</p>
           </div>
           <div className="kpi-strip kpi-strip-v1">
             {(corridor?.overviewMetrics ?? []).map((card) => (
@@ -6469,6 +6791,39 @@ export function App() {
                     </button>
                   );
                 })}
+              </div>
+              <div className="bulk-phase-selector">
+                <label htmlFor="bulk-intersection-phases">Intersection-phase pairs</label>
+                <div className="bulk-phase-selector__controls">
+                  <textarea
+                    id="bulk-intersection-phases"
+                    value={bulkPhaseInput}
+                    rows={2}
+                    placeholder={'1240-2, 1242-4\nor {"1240": 2, "1242": 4}'}
+                    aria-describedby="bulk-intersection-phases-help"
+                    onChange={(event) => {
+                      setBulkPhaseInput(event.target.value);
+                      setBulkPhaseMessage(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                        event.preventDefault();
+                        applyBulkIntersectionPhases();
+                      }
+                    }}
+                  />
+                  <button type="button" className="preset-chip bulk-phase-selector__apply" onClick={applyBulkIntersectionPhases}>
+                    Apply
+                  </button>
+                </div>
+                <small id="bulk-intersection-phases-help">
+                  Applying replaces the selected intersections and their phase overrides. Press Ctrl/⌘ + Enter to apply.
+                </small>
+                {bulkPhaseMessage ? (
+                  <span className={`bulk-phase-selector__message ${bulkPhaseMessage.tone}`} role={bulkPhaseMessage.tone === "error" ? "alert" : "status"}>
+                    {bulkPhaseMessage.text}
+                  </span>
+                ) : null}
               </div>
             </div>
           </div>
@@ -6521,22 +6876,24 @@ export function App() {
             </div>
             <div className="chart-wrap">
               <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={phaseChartData}>
+                <ComposedChart data={phaseChartData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#d9ddd5" />
                   <XAxis dataKey="phase" stroke="#4c5a57" />
-                  <YAxis stroke="#4c5a57" />
+                  <YAxis yAxisId="counts" stroke="#4c5a57" />
+                  <YAxis yAxisId="seconds" orientation="right" stroke="#366a8a" unit=" s" />
                   <Tooltip />
                   <Legend />
-                  <Bar dataKey="splitFailures" fill="#c98358" radius={[6, 6, 0, 0]} />
-                  <Bar dataKey="maxOuts" fill="#7b3032" radius={[6, 6, 0, 0]} />
-                  <Bar dataKey="gapOuts" fill="#68a77e" radius={[6, 6, 0, 0]} />
-                  <Bar dataKey="forceOffs" fill="#3f654c" radius={[6, 6, 0, 0]} />
-                </BarChart>
+                  <Bar yAxisId="counts" dataKey="splitFailures" name="Split Failures" fill="#c98358" radius={[6, 6, 0, 0]} />
+                  <Bar yAxisId="counts" dataKey="maxOuts" name="Max-Outs" fill="#7b3032" radius={[6, 6, 0, 0]} />
+                  <Bar yAxisId="counts" dataKey="gapOuts" name="Gap-Outs" fill="#68a77e" radius={[6, 6, 0, 0]} />
+                  <Bar yAxisId="counts" dataKey="forceOffs" name="Force-Offs" fill="#3f654c" radius={[6, 6, 0, 0]} />
+                  <Line yAxisId="seconds" type="monotone" dataKey="averageSplitLength" name="Avg Split Length (s)" stroke="#366a8a" strokeWidth={3} dot={{ r: 4 }} />
+                </ComposedChart>
               </ResponsiveContainer>
             </div>
             {insightBlock(
               "What this shows",
-              "A phase-by-phase view of split failures and termination behavior across the selected signals.",
+              "A phase-by-phase view of average split length, split failures, and termination behavior across the selected signals.",
               phaseChartData.length
                 ? "This shows which phases are ending by demand exhaustion versus gap-out or coordination force-off."
                 : "No phase operation counts are available for the current selection."
@@ -6684,6 +7041,7 @@ export function App() {
                   <th>Avg Wait (s)</th>
                   <th>Green Occ %</th>
                   <th>Red Occ %</th>
+                  <th>Avg Split Length (s)</th>
                   <th>Split Failures</th>
                   <th>Max-Outs</th>
                   <th>Gap-Outs</th>
@@ -6701,6 +7059,7 @@ export function App() {
                       <td>{phase.avgWait.toFixed(1)}</td>
                       <td>{phase.greenOccupancyPct.toFixed(1)}</td>
                       <td>{phase.redOccupancyPct.toFixed(1)}</td>
+                      <td>{phase.greenTime.toFixed(1)}</td>
                       <td>{phase.splitFailures}</td>
                       <td>{phase.maxOuts}</td>
                       <td>{phase.gapOuts}</td>
@@ -6879,6 +7238,7 @@ export function App() {
           onMoeChange={setGroupingPreviewMoe}
           threshold={groupingPreviewThreshold}
           onThresholdChange={setGroupingPreviewThreshold}
+          onLoadingChange={setGroupingPreviewLoading}
         />
       ) : activeView === "correlationCliques" ? (
         <CorrelationCliquesView
@@ -6941,7 +7301,8 @@ export function App() {
           error={hdbscanError}
           selectedSignalIds={hdbscanSignalIds}
           onToggleSignal={toggleHdbscanSignalSelection}
-          onApplySignalPreset={setHdbscanSignalIds}
+          onApplySignalPreset={(ids) => { setHdbscanSignalIds(ids); setHdbscanIntersectionPhases({}); }}
+          onApplyIntersectionPhases={setHdbscanIntersectionPhases}
           selectedPhases={hdbscanPhases}
           onTogglePhase={toggleHdbscanPhase}
           selectedMoes={hdbscanMoes}

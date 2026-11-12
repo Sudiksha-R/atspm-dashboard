@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -12,7 +13,7 @@ from datetime import date, datetime, timedelta
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -42,6 +43,11 @@ DEFAULT_BEE_RIDGE_DIR_CANDIDATES = (
 DEFAULT_HISTORICAL_SIGNAL_ID = "1240"
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 WEEKDAY_NAMES = DAY_NAMES[:5]
+DEMO_DATE_FROM = date(2026, 3, 1)
+DEMO_DATE_TO = date(2026, 5, 31)
+DEMO_DAYS = DAY_NAMES
+DEMO_CACHE_VERSION = "v1"
+DEMO_CACHE_DIR = ROOT / "derived" / f"demo_api_cache_{DEMO_CACHE_VERSION}"
 TIME_OF_DAY_PRESETS = [
     {"id": "am-peak", "label": "Weekday AM Peak", "start": "06:00", "end": "09:00"},
     {"id": "midday", "label": "Midday", "start": "10:00", "end": "14:00"},
@@ -52,6 +58,7 @@ TIME_OF_DAY_PRESETS = [
 RESPONSE_CACHE_MAX_ITEMS = 48
 RESPONSE_CACHE: dict[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], dict[str, Any]] = {}
 RESPONSE_CACHE_LOCK = Lock()
+RESPONSE_CACHE_IN_FLIGHT: dict[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], Event] = {}
 GROUPING_MOE_ALIASES = {
     "avgWait": "avgWait",
     "aogPct": "aogPct",
@@ -237,12 +244,27 @@ def _mapping_frame() -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def _available_signal_ids() -> tuple[int, ...]:
+    inventory_cache = DEMO_CACHE_DIR / "signal_ids.json"
+    if inventory_cache.exists():
+        try:
+            cached_ids = json.loads(inventory_cache.read_text(encoding="utf-8"))
+            if isinstance(cached_ids, list) and cached_ids:
+                return tuple(sorted({int(value) for value in cached_ids}))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
     ids: set[int] = set()
     for path in _raw_files().values():
         for chunk in pd.read_csv(path, usecols=["signalID"], chunksize=750_000):
             numeric_ids = pd.to_numeric(chunk["signalID"], errors="coerce").dropna().astype(int)
             ids.update(numeric_ids.unique().tolist())
-    return tuple(sorted(ids))
+    discovered_ids = tuple(sorted(ids))
+    if discovered_ids:
+        inventory_cache.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = inventory_cache.with_suffix(f".{os.getpid()}.tmp")
+        temporary_path.write_text(json.dumps(discovered_ids), encoding="utf-8")
+        temporary_path.replace(inventory_cache)
+    return discovered_ids
 
 
 @lru_cache(maxsize=1)
@@ -301,7 +323,7 @@ def _metric_definitions() -> dict[str, str]:
         "gap_outs": "Terminations where demand ended before max green was reached.",
         "force_offs": "Terminations forced by coordination or controller timing constraints.",
         "skips": "Phase calls that were not served within the expected cycle window.",
-        "phase_green_time": "Average green time served for the selected phase grouping.",
+        "phase_green_time": "Average split length: the mean green time served to the selected phase grouping, in seconds.",
     }
 
 
@@ -313,22 +335,78 @@ def _parse_selected_ids(raw_ids: str | None) -> list[str]:
     return selected or DEFAULT_SELECTED_IDS
 
 
+def _parse_intersection_phases(raw_phases: str | None) -> dict[str, int]:
+    if not raw_phases:
+        return {}
+    parsed: dict[str, int] = {}
+    for item in raw_phases.split(","):
+        signal_id, separator, phase_text = item.strip().partition(":")
+        if not separator or signal_id not in INTERSECTION_LOOKUP:
+            continue
+        try:
+            phase = int(phase_text)
+        except ValueError:
+            continue
+        if 1 <= phase <= 8:
+            parsed[signal_id] = phase
+    return parsed
+
+
+def _configured_phases(selected_ids: list[str]) -> list[int]:
+    mapping = _mapping_frame()
+    device_ids = pd.to_numeric(mapping["DeviceId"], errors="coerce")
+    phases = pd.to_numeric(mapping["Phase"], errors="coerce")
+    selected = {int(signal_id) for signal_id in selected_ids}
+    return sorted({int(phase) for phase in phases[device_ids.isin(selected)].dropna() if 1 <= int(phase) <= 8})
+
+
+def _filter_phase_rows(
+    frame: pd.DataFrame,
+    selected_phase: str,
+    intersection_phases: dict[str, int] | None = None,
+) -> pd.DataFrame:
+    if frame.empty or "Phase" not in frame.columns:
+        return frame
+
+    intersection_phases = intersection_phases or {}
+    phases = pd.to_numeric(frame["Phase"], errors="coerce")
+    if "DeviceId" in frame.columns and intersection_phases:
+        device_ids = pd.to_numeric(frame["DeviceId"], errors="coerce").astype("Int64").astype(str)
+        overrides = pd.to_numeric(device_ids.map(intersection_phases), errors="coerce")
+        has_override = overrides.notna()
+    else:
+        overrides = pd.Series(float("nan"), index=frame.index)
+        has_override = pd.Series(False, index=frame.index)
+
+    if selected_phase == "corridor":
+        global_match = phases.isin([2, 6])
+    elif selected_phase == "all":
+        global_match = pd.Series(True, index=frame.index)
+    elif selected_phase == "all_except_2_6":
+        global_match = ~phases.isin([2, 6])
+    else:
+        try:
+            global_match = phases == int(selected_phase)
+        except ValueError:
+            global_match = pd.Series(True, index=frame.index)
+
+    matches = (has_override & phases.eq(overrides)) | (~has_override & global_match)
+    return frame.loc[matches].copy()
+
+
 def _parse_days(raw_days: str | None, fallback_date_from: date, fallback_date_to: date) -> list[str]:
     if raw_days:
         selected = [part.strip() for part in raw_days.split(",") if part.strip() in DAY_NAMES]
         if selected:
             return selected
-    return WEEKDAY_NAMES
+    return DEMO_DAYS
 
 
 def _default_date_window(available_dates: list[date]) -> tuple[date, date]:
     if not available_dates:
         default_date = _default_analysis_date()
         return default_date, default_date
-    date_to = max(available_dates)
-    earliest = min(available_dates)
-    date_from = max(earliest, date_to - timedelta(days=30))
-    return date_from, date_to
+    return DEMO_DATE_FROM, DEMO_DATE_TO
 
 
 def _parse_preset(preset_id: str | None) -> dict[str, str]:
@@ -512,7 +590,11 @@ def _bucket_label(ts: pd.Timestamp, freq: str) -> str:
     return ts.strftime("%m/%d")
 
 
-def _phase_table(tables: dict[str, pd.DataFrame], selected_phase: str) -> pd.DataFrame:
+def _phase_table(
+    tables: dict[str, pd.DataFrame],
+    selected_phase: str,
+    intersection_phases: dict[str, int] | None = None,
+) -> pd.DataFrame:
     aog = tables["arrival_on_green"]
     split_failures = tables["split_failures"]
     phase_wait = tables["phase_wait"]
@@ -578,14 +660,9 @@ def _phase_table(tables: dict[str, pd.DataFrame], selected_phase: str) -> pd.Dat
         if column not in phase_table.columns:
             phase_table[column] = 0
 
-    if selected_phase == "all_except_2_6":
-        phase_table = phase_table[~phase_table["Phase"].isin([2, 6])]
-        if phase_table.empty:
-            return _empty_phase_table()
-    elif selected_phase != "all":
-        phase_table = phase_table[phase_table["Phase"] == int(selected_phase)]
-        if phase_table.empty:
-            return _empty_phase_table()
+    phase_table = _filter_phase_rows(phase_table, selected_phase, intersection_phases)
+    if phase_table.empty:
+        return _empty_phase_table()
 
     phase_table["red_time"] = (phase_table["cycle_length"] - phase_table["green_time"]).clip(lower=0)
     phase_table["gor_proxy"] = phase_table["green_time"] * phase_table["green_occupancy"]
@@ -598,6 +675,7 @@ def _trend_table(
     selected_phase: str,
     date_from: date,
     date_to: date,
+    intersection_phases: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     freq = _bucket_frequency(date_from, date_to)
     buckets: list[pd.DataFrame] = []
@@ -617,25 +695,10 @@ def _trend_table(
     terminations = with_bucket(tables["terminations"])
     coordination = with_bucket(tables["coordination_agg"])
 
-    if selected_phase == "all_except_2_6":
-        if not aog.empty and "Phase" in aog.columns:
-            aog = aog[~aog["Phase"].isin([2, 6])]
-        if not split_failures.empty and "Phase" in split_failures.columns:
-            split_failures = split_failures[~split_failures["Phase"].isin([2, 6])]
-        if not phase_wait.empty and "Phase" in phase_wait.columns:
-            phase_wait = phase_wait[~phase_wait["Phase"].isin([2, 6])]
-        if not terminations.empty and "Phase" in terminations.columns:
-            terminations = terminations[~terminations["Phase"].isin([2, 6])]
-    elif selected_phase != "all":
-        phase_value = int(selected_phase)
-        if not aog.empty and "Phase" in aog.columns:
-            aog = aog[aog["Phase"] == phase_value]
-        if not split_failures.empty and "Phase" in split_failures.columns:
-            split_failures = split_failures[split_failures["Phase"] == phase_value]
-        if not phase_wait.empty and "Phase" in phase_wait.columns:
-            phase_wait = phase_wait[phase_wait["Phase"] == phase_value]
-        if not terminations.empty and "Phase" in terminations.columns:
-            terminations = terminations[terminations["Phase"] == phase_value]
+    aog = _filter_phase_rows(aog, selected_phase, intersection_phases)
+    split_failures = _filter_phase_rows(split_failures, selected_phase, intersection_phases)
+    phase_wait = _filter_phase_rows(phase_wait, selected_phase, intersection_phases)
+    terminations = _filter_phase_rows(terminations, selected_phase, intersection_phases)
 
     if aog.empty and split_failures.empty and phase_wait.empty:
         return _empty_trend_table()
@@ -792,7 +855,7 @@ def _build_metric_cards(phase_table: pd.DataFrame) -> tuple[list[dict[str, str]]
         },
         {
             "id": "phase_green_time",
-            "label": "Green Time",
+            "label": "Average Split Length",
             "value": _format_value(_safe_mean(phase_table["green_time"]), "seconds"),
             "description": definitions["phase_green_time"],
         },
@@ -913,6 +976,7 @@ def _historical_dashboard_tables(
     hour_from: str,
     hour_to: str,
     selected_phase: str,
+    intersection_phases: dict[str, int] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     hour_start = int(hour_from.split(":")[0])
     hour_end = int(hour_to.split(":")[0])
@@ -987,7 +1051,17 @@ def _historical_dashboard_tables(
         terms = _filter_rank_frame(terms, days_of_week)
         coordination = _filter_rank_frame(coordination, days_of_week)
 
-        if selected_phase == "all_except_2_6":
+        effective_phase = str((intersection_phases or {}).get(intersection_id, selected_phase))
+        if effective_phase == "corridor":
+            if not aog.empty:
+                aog = aog[aog["Phase"].isin([2, 6])]
+            if not waits.empty:
+                waits = waits[waits["Phase"].isin([2, 6])]
+            if not split.empty:
+                split = split[split["Phase"].isin([2, 6])]
+            if not terms.empty:
+                terms = terms[terms["Phase"].isin([2, 6])]
+        elif effective_phase == "all_except_2_6":
             if not aog.empty:
                 aog = aog[~aog["Phase"].isin([2, 6])]
             if not waits.empty:
@@ -996,9 +1070,9 @@ def _historical_dashboard_tables(
                 split = split[~split["Phase"].isin([2, 6])]
             if not terms.empty:
                 terms = terms[~terms["Phase"].isin([2, 6])]
-        elif selected_phase != "all":
+        elif effective_phase != "all":
             try:
-                phase_value = int(selected_phase)
+                phase_value = int(effective_phase)
             except ValueError:
                 phase_value = None
             if phase_value is not None:
@@ -1161,12 +1235,26 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
         query.get("hourTo", [None])[0],
     )
     selected_phase = query.get("phase", ["all"])[0]
+    intersection_phases = _parse_intersection_phases(query.get("intersectionPhases", [None])[0])
+
+    if (
+        date_from == DEMO_DATE_FROM
+        and date_to == DEMO_DATE_TO
+        and set(days_of_week) == set(DEMO_DAYS)
+        and set(selected_ids) == set(ORDERED_SIGNAL_IDS)
+    ):
+        # The shared demo window is already represented by the precomputed
+        # historical MOE store. Reuse it instead of loading several gigabytes
+        # of raw events for the Ad Hoc tab's initial view.
+        return build_historical_dashboard_payload(query)
 
     raw_data = _load_raw_slice(selected_ids, date_from, date_to, days_of_week, hour_from, hour_to)
     detector_config = _build_detector_config(selected_ids)
     tables = _run_processor(raw_data, detector_config)
-    phase_table = _phase_table(tables, selected_phase)
-    trend_table = _trend_table(tables, selected_phase, date_from, date_to)
+    phase_table = _phase_table(tables, selected_phase, intersection_phases)
+    trend_table = _trend_table(tables, selected_phase, date_from, date_to, intersection_phases)
+    corridor_phase_table = _phase_table(tables, "corridor")
+    corridor_trend_table = _trend_table(tables, "corridor", date_from, date_to)
 
     selected_intersections = [
         _intersection_payload(INTERSECTION_LOOKUP[intersection_id], phase_table, trend_table)
@@ -1178,11 +1266,11 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
         for meta in _intersection_inventory()
     ]
 
-    if trend_table.empty:
+    if corridor_trend_table.empty:
         combined_trend: list[dict[str, Any]] = []
     else:
         combined = (
-            trend_table.groupby("label")
+            corridor_trend_table.groupby("label")
             .agg(
                 aog=("aog", "mean"),
                 avg_wait=("avg_wait", "mean"),
@@ -1212,7 +1300,7 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
             for _, row in combined.iterrows()
         ]
 
-    overview_metrics, phase_operation_metrics = _build_metric_cards(phase_table if not phase_table.empty else pd.DataFrame({
+    empty_metric_table = pd.DataFrame({
         "aog": pd.Series(dtype=float),
         "avg_wait": pd.Series(dtype=float),
         "green_occupancy": pd.Series(dtype=float),
@@ -1225,9 +1313,15 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
         "ForceOff": pd.Series(dtype=float),
         "skips": pd.Series(dtype=float),
         "green_time": pd.Series(dtype=float),
-    }))
+    })
+    overview_metrics, _ = _build_metric_cards(
+        corridor_phase_table if not corridor_phase_table.empty else empty_metric_table
+    )
+    _, phase_operation_metrics = _build_metric_cards(
+        phase_table if not phase_table.empty else empty_metric_table
+    )
 
-    available_phases = sorted({int(phase) for phase in phase_table["Phase"].unique().tolist()}) if not phase_table.empty else []
+    available_phases = _configured_phases(selected_ids)
 
     return {
         "meta": {
@@ -1244,7 +1338,7 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
             "timeOfDayPresets": TIME_OF_DAY_PRESETS,
             "selectionPresets": [
                 {"id": "all", "label": "All signals", "intersectionIds": ORDERED_SIGNAL_IDS},
-                {"id": "first-three", "label": "First three", "intersectionIds": DEFAULT_SELECTED_IDS},
+                {"id": "first-three", "label": "First three", "intersectionIds": ORDERED_SIGNAL_IDS[:3]},
                 {
                     "id": "last-three",
                     "label": "Last three",
@@ -1262,12 +1356,13 @@ def build_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
             "timeOfDayPreset": preset_id,
             "selectedIntersectionIds": selected_ids,
             "selectedPhase": selected_phase,
+            "selectedIntersectionPhases": intersection_phases,
         },
         "corridor": {
             "id": "florida-atspm-october",
             "name": "Florida ATSPM Operations",
             "region": "Florida",
-            "summary": _corridor_summary(phase_table) if not phase_table.empty else _corridor_summary(pd.DataFrame({
+            "summary": _corridor_summary(corridor_phase_table) if not corridor_phase_table.empty else _corridor_summary(pd.DataFrame({
                 "aog": pd.Series(dtype=float),
                 "avg_wait": pd.Series(dtype=float),
                 "green_occupancy": pd.Series(dtype=float),
@@ -1293,22 +1388,77 @@ def _api_cache_key(path: str, query: dict[str, list[str]]) -> tuple[str, tuple[t
     return (path, tuple(sorted((key, tuple(values)) for key, values in query.items())))
 
 
+def _persistent_cache_path(
+    key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+) -> Path:
+    canonical = json.dumps(key, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    endpoint = key[0].strip("/").replace("/", "-") or "root"
+    return DEMO_CACHE_DIR / f"{endpoint}-{digest}.json"
+
+
+def _load_persistent_api_payload(
+    key: tuple[str, tuple[tuple[str, tuple[str, ...]], ...]],
+) -> dict[str, Any] | None:
+    cache_path = _persistent_cache_path(key)
+    if not cache_path.exists():
+        return None
+    try:
+        with cache_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_persistent_api_payload(
+    path: str,
+    query: dict[str, list[str]],
+    payload: dict[str, Any],
+) -> Path:
+    key = _api_cache_key(path, query)
+    cache_path = _persistent_cache_path(key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_suffix(f".{os.getpid()}.tmp")
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, default=_json_safe_default, separators=(",", ":"))
+    temporary_path.replace(cache_path)
+    return cache_path
+
+
 def _cached_api_payload(
     path: str,
     query: dict[str, list[str]],
     builder,
 ) -> dict[str, Any]:
     key = _api_cache_key(path, query)
-    with RESPONSE_CACHE_LOCK:
-        cached = RESPONSE_CACHE.get(key)
-        if cached is not None:
-            return cached
-    payload = builder(query)
-    with RESPONSE_CACHE_LOCK:
-        if len(RESPONSE_CACHE) >= RESPONSE_CACHE_MAX_ITEMS:
-            RESPONSE_CACHE.pop(next(iter(RESPONSE_CACHE)))
-        RESPONSE_CACHE[key] = payload
-    return payload
+    while True:
+        with RESPONSE_CACHE_LOCK:
+            cached = RESPONSE_CACHE.get(key)
+            if cached is not None:
+                return cached
+            persisted = _load_persistent_api_payload(key)
+            if persisted is not None:
+                RESPONSE_CACHE[key] = persisted
+                return persisted
+            pending = RESPONSE_CACHE_IN_FLIGHT.get(key)
+            if pending is None:
+                pending = Event()
+                RESPONSE_CACHE_IN_FLIGHT[key] = pending
+                break
+        pending.wait()
+
+    try:
+        payload = builder(query)
+        with RESPONSE_CACHE_LOCK:
+            if len(RESPONSE_CACHE) >= RESPONSE_CACHE_MAX_ITEMS:
+                RESPONSE_CACHE.pop(next(iter(RESPONSE_CACHE)))
+            RESPONSE_CACHE[key] = payload
+        return payload
+    finally:
+        with RESPONSE_CACHE_LOCK:
+            RESPONSE_CACHE_IN_FLIGHT.pop(key, None)
+            pending.set()
 
 
 def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str, Any]:
@@ -1328,13 +1478,21 @@ def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str,
         query.get("hourTo", [None])[0],
     )
     selected_phase = query.get("phase", ["all"])[0]
+    intersection_phases = _parse_intersection_phases(query.get("intersectionPhases", [None])[0])
 
     all_ids = [meta.id for meta in _intersection_inventory()]
-    selected_phase_table, selected_trend_table = _historical_dashboard_tables(
-        selected_ids, date_from, date_to, days_of_week, hour_from, hour_to, selected_phase
-    )
     all_phase_table, all_trend_table = _historical_dashboard_tables(
-        all_ids, date_from, date_to, days_of_week, hour_from, hour_to, selected_phase
+        all_ids, date_from, date_to, days_of_week, hour_from, hour_to, selected_phase, intersection_phases
+    )
+    if set(selected_ids) == set(all_ids):
+        selected_phase_table = all_phase_table
+        selected_trend_table = all_trend_table
+    else:
+        selected_phase_table, selected_trend_table = _historical_dashboard_tables(
+            selected_ids, date_from, date_to, days_of_week, hour_from, hour_to, selected_phase, intersection_phases
+        )
+    corridor_phase_table, corridor_trend_table = _historical_dashboard_tables(
+        selected_ids, date_from, date_to, days_of_week, hour_from, hour_to, "corridor"
     )
 
     selected_intersections = [
@@ -1347,11 +1505,11 @@ def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str,
         for meta in _intersection_inventory()
     ]
 
-    if selected_trend_table.empty:
+    if corridor_trend_table.empty:
         combined_trend: list[dict[str, Any]] = []
     else:
         combined = (
-            selected_trend_table.groupby("label")
+            corridor_trend_table.groupby("label")
             .agg(
                 aog=("aog", "mean"),
                 avg_wait=("avg_wait", "mean"),
@@ -1381,14 +1539,13 @@ def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str,
             for _, row in combined.iterrows()
         ]
 
-    overview_metrics, phase_operation_metrics = _build_metric_cards(
+    overview_metrics, _ = _build_metric_cards(
+        corridor_phase_table if not corridor_phase_table.empty else _dashboard_metric_seed()
+    )
+    _, phase_operation_metrics = _build_metric_cards(
         selected_phase_table if not selected_phase_table.empty else _dashboard_metric_seed()
     )
-    available_phases = (
-        sorted({int(phase) for phase in all_phase_table["Phase"].unique().tolist()})
-        if not all_phase_table.empty and "Phase" in all_phase_table.columns
-        else []
-    )
+    available_phases = _configured_phases(selected_ids)
 
     return {
         "meta": {
@@ -1401,7 +1558,7 @@ def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str,
             "timeOfDayPresets": TIME_OF_DAY_PRESETS,
             "selectionPresets": [
                 {"id": "all", "label": "All signals", "intersectionIds": ORDERED_SIGNAL_IDS},
-                {"id": "first-three", "label": "First three", "intersectionIds": DEFAULT_SELECTED_IDS},
+                {"id": "first-three", "label": "First three", "intersectionIds": ORDERED_SIGNAL_IDS[:3]},
                 {
                     "id": "last-three",
                     "label": "Last three",
@@ -1419,12 +1576,13 @@ def build_historical_dashboard_payload(query: dict[str, list[str]]) -> dict[str,
             "timeOfDayPreset": preset_id,
             "selectedIntersectionIds": selected_ids,
             "selectedPhase": selected_phase,
+            "selectedIntersectionPhases": intersection_phases,
         },
         "corridor": {
             "id": "historical-dashboard",
             "name": "Dashboard",
             "region": "Precomputed MOE summary",
-            "summary": _corridor_summary(selected_phase_table if not selected_phase_table.empty else _dashboard_metric_seed()),
+            "summary": _corridor_summary(corridor_phase_table if not corridor_phase_table.empty else _dashboard_metric_seed()),
             "overviewMetrics": overview_metrics,
             "phaseOperationMetrics": phase_operation_metrics,
             "availablePhases": available_phases,
@@ -1638,7 +1796,7 @@ def _historical_available_signals() -> list[dict[str, str | float]]:
 def _signal_selection_presets() -> list[dict[str, Any]]:
     return [
         {"id": "all", "label": "All signals", "intersectionIds": ORDERED_SIGNAL_IDS},
-        {"id": "first-three", "label": "First three", "intersectionIds": DEFAULT_SELECTED_IDS},
+        {"id": "first-three", "label": "First three", "intersectionIds": ORDERED_SIGNAL_IDS[:3]},
         {"id": "last-three", "label": "Last three", "intersectionIds": ORDERED_SIGNAL_IDS[-3:]},
     ]
 
@@ -1859,9 +2017,9 @@ def build_grouping_preview_payload(query: dict[str, list[str]]) -> dict[str, Any
     end_date = _safe_date(date_to_raw, default_date_to)
 
     days_raw = query.get("daysOfWeek", [""])[0]
-    weekdays = {day for day in days_raw.split(",") if day} if days_raw else set(WEEKDAY_NAMES)
+    weekdays = {day for day in days_raw.split(",") if day} if days_raw else set(DEMO_DAYS)
     if not weekdays:
-        weekdays = set(WEEKDAY_NAMES)
+        weekdays = set(DEMO_DAYS)
 
     hour_from = _hour_label_to_int(query.get("hourFrom", ["06:00"])[0])
     hour_to = _hour_label_to_int(query.get("hourTo", ["18:00"])[0])
@@ -2073,9 +2231,9 @@ def build_bottleneck_detection_payload(query: dict[str, list[str]]) -> dict[str,
         1_000_000.0,
     )
     days_raw = query.get("daysOfWeek", [""])[0]
-    selected_days = [day for day in days_raw.split(",") if day in DAY_NAMES] if days_raw else WEEKDAY_NAMES
+    selected_days = [day for day in days_raw.split(",") if day in DAY_NAMES] if days_raw else DEMO_DAYS
     if not selected_days:
-        selected_days = WEEKDAY_NAMES
+        selected_days = DEMO_DAYS
     weekdays = {day for day in selected_days}
     weekday_abbrevs = [day[:3] for day in DAY_NAMES if day in weekdays]
 
@@ -2378,9 +2536,9 @@ def build_correlation_cliques_payload(query: dict[str, list[str]]) -> dict[str, 
         start_date, end_date = end_date, start_date
 
     days_raw = query.get("daysOfWeek", [""])[0]
-    selected_days = [day for day in days_raw.split(",") if day in DAY_NAMES] if days_raw else WEEKDAY_NAMES
+    selected_days = [day for day in days_raw.split(",") if day in DAY_NAMES] if days_raw else DEMO_DAYS
     if not selected_days:
-        selected_days = WEEKDAY_NAMES
+        selected_days = DEMO_DAYS
     weekdays = set(selected_days)
     weekday_abbrevs = [day[:3] for day in DAY_NAMES if day in weekdays]
 
@@ -2756,6 +2914,7 @@ def _build_multi_bottleneck_hourly_vectors(
     date_to: date,
     hour_start: int,
     hour_end: int,
+    intersection_phases: dict[str, int] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, list[int]], list[int]]:
     frames: list[pd.DataFrame] = []
     available_phase_map: dict[str, list[int]] = {}
@@ -2770,7 +2929,9 @@ def _build_multi_bottleneck_hourly_vectors(
             phases_for_signal = _available_phase_list(conn)
             available_phase_map[signal_id] = phases_for_signal
             all_available_phases.update(phases_for_signal)
-            phases_to_use = [phase for phase in selected_phases if phase in set(phases_for_signal)]
+            phase_override = (intersection_phases or {}).get(signal_id)
+            requested_phases = [phase_override] if phase_override is not None else selected_phases
+            phases_to_use = [phase for phase in requested_phases if phase in set(phases_for_signal)]
             for phase in phases_to_use:
                 frame = _build_bottleneck_hourly_vectors(
                     conn,
@@ -3110,16 +3271,28 @@ def build_ranking_payload(query: dict[str, list[str]]) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     sql_params = (date_from.isoformat(), date_to.isoformat(), hour_start, hour_end)
-    all_ids = [meta.id for meta in _intersection_inventory()]
+    inventory = _intersection_inventory()
+    missing_historical_ids = [
+        meta.id
+        for meta in inventory
+        if not historical_output_paths(int(meta.id))["sqlite_path"].exists()
+    ]
     raw_phase_table = _empty_phase_table()
 
-    raw_data = _load_raw_slice(all_ids, date_from, date_to, days_of_week, hour_from, hour_to)
-    if not raw_data.empty:
-        detector_config = _build_detector_config(all_ids)
+    # Raw event processing is only a fallback. Most deployments have a saved
+    # historical database for every signal, so avoid reprocessing the complete
+    # corridor on every cold Ranking request.
+    raw_data = (
+        _load_raw_slice(missing_historical_ids, date_from, date_to, days_of_week, hour_from, hour_to)
+        if missing_historical_ids
+        else pd.DataFrame()
+    )
+    if missing_historical_ids and not raw_data.empty:
+        detector_config = _build_detector_config(missing_historical_ids)
         tables = _run_processor(raw_data, detector_config)
         raw_phase_table = _phase_table(tables, "all")
 
-    for meta in _intersection_inventory():
+    for meta in inventory:
         sqlite_path = historical_output_paths(int(meta.id))["sqlite_path"]
         if not sqlite_path.exists():
             fallback = raw_phase_table[raw_phase_table["DeviceId"] == int(meta.id)].copy()
@@ -3924,7 +4097,7 @@ def build_bottleneck_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
-    days_of_week = WEEKDAY_NAMES
+    days_of_week = DEMO_DAYS
     hour_start = 6
     hour_end = 21
     selected_moes = _parse_bottleneck_moes(query.get("moes", [None])[0])
@@ -4129,12 +4302,13 @@ def build_hdbscan_payload(query: dict[str, list[str]]) -> dict[str, Any]:
     if date_to < date_from:
         date_from, date_to = date_to, date_from
 
-    days_of_week = WEEKDAY_NAMES
+    days_of_week = DEMO_DAYS
     hour_start = 6
     hour_end = 21
     selected_signal_ids = _parse_signal_id_list(query.get("signalIds", [None])[0])
     all_available_phases = list(range(1, 9))
     selected_phases = _parse_phase_id_list(query.get("phases", [None])[0], all_available_phases)
+    intersection_phases = _parse_intersection_phases(query.get("intersectionPhases", [None])[0])
     selected_moes = _parse_bottleneck_moes(query.get("moes", [None])[0])
     min_cluster_size = _parse_int_range(query.get("minClusterSize", [None])[0], 6, 2, 40)
     min_samples = _parse_int_range(query.get("minSamples", [None])[0], 3, 1, 20)
@@ -4147,6 +4321,7 @@ def build_hdbscan_payload(query: dict[str, list[str]]) -> dict[str, Any]:
         date_to,
         hour_start,
         hour_end,
+        intersection_phases,
     )
     effective_phases = _parse_phase_id_list(
         ",".join(str(phase) for phase in selected_phases),
@@ -4262,6 +4437,7 @@ def build_hdbscan_payload(query: dict[str, list[str]]) -> dict[str, Any]:
         "filters": {
             "signalIds": selected_signal_ids,
             "phases": effective_phases,
+            "selectedIntersectionPhases": intersection_phases,
             "dateFrom": date_from.isoformat(),
             "dateTo": date_to.isoformat(),
             "daysOfWeek": days_of_week,

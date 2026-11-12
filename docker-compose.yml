@@ -1,0 +1,30 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      ATSPM_BACKEND_HOST: 0.0.0.0
+      ATSPM_BACKEND_PORT: 8000
+      ATSPM_RAW_DIR: ${ATSPM_RAW_DIR:-/app/derived/bee_ridge_atspm_feb_to_may}
+      ATSPM_RAW_GLOB: ${ATSPM_RAW_GLOB:-atspm-*_filtered.csv}
+    volumes:
+      - ./derived:/app/derived
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: dashboard-app/Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "4174:80"

@@ -257,6 +257,29 @@ def _write_metadata(
     metadata.to_sql("run_metadata", conn, if_exists="replace", index=False)
 
 
+def _create_query_indexes(conn: sqlite3.Connection) -> None:
+    """Create the indexes used by the dashboard after bulk writes finish."""
+    for table_name in AGGREGATION_TABLES:
+        columns = {
+            str(row[1])
+            for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        }
+        if not {"run_date", "hour"}.issubset(columns):
+            continue
+        index_columns = ["run_date", "hour"]
+        if "Phase" in columns:
+            index_columns.append("Phase")
+        conn.execute(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_dashboard_window" '
+            f'ON "{table_name}" ({", ".join(index_columns)})'
+        )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hourly_run_status_dashboard_window "
+        "ON hourly_run_status (run_date, hour)"
+    )
+
+
 def run_signal_history(signal_id: int, pattern: str = DEFAULT_RAW_GLOB) -> dict[str, Path]:
     run_id = f"signal-{signal_id}-october-hourly-dask"
     files = _raw_files(pattern)
@@ -351,6 +374,7 @@ def run_signal_history(signal_id: int, pattern: str = DEFAULT_RAW_GLOB) -> dict[
         pd.DataFrame(daily_rows).to_sql("daily_files", conn, if_exists="replace", index=False)
         pd.DataFrame(file_rows).to_sql("hour_files", conn, if_exists="replace", index=False)
         pd.DataFrame(status_rows).to_sql("hourly_run_status", conn, if_exists="replace", index=False)
+        _create_query_indexes(conn)
 
     return paths
 

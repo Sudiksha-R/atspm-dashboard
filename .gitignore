@@ -1,5 +1,6 @@
 .DS_Store
 .venv/
+.python_deps/
 __pycache__/
 *.pyc
 *.pyo
@@ -24,3 +25,30 @@ dashboard-app/*.tsbuildinfo
 *.sqlite
 *.sqlite3
 *.parquet
+*.duckdb
+
+# Local container build/runtime artifacts
+.apptainer/
+.apptainer-cache/
+.podman-cache/
+.podman-config/
+.podman-data/
+
+# Local configuration, logs, backups, and packaged deliverables
+.env
+*.log
+*.pid
+*.bak
+*.tar.gz
+*.pptx
+26.1.2
+
+# Local source-data copies and generated review artifacts
+atspm_feb_source/
+atspm_older/
+artifacts/
+experiments/
+notebooks/
+**/notebooks/
+scripts/capture_anomaly_dashboard_slides.js
+anomaly-dashboard/
